@@ -97,6 +97,8 @@ Reviewers judge rules 2 to 5 and 8. The `Comments` check (`scripts/check-comment
 
 Only comment blocks holding a line your PR added can fail the citation and block rules, and the TODO and URL rules grade only the lines your PR added. Broken citations elsewhere in a file you touched are printed as warnings, and fixing one while you are there is welcome. To grade files by hand, pass their paths: `node scripts/check-comment-citations.mjs path/to/file.ts`.
 
+Run both checks before pushing: `node scripts/check-comment-citations.mjs` and `node scripts/comment-ratchet.mjs` grade your branch against its merge-base with `origin/main` (set `COMMENT_CHECK_BASE` to compare with another base). The pre-commit hooks run neither.
+
 ## Adding Registry Items (Blocks & Components)
 
 The registry at `registry/` contains reusable items installable via `hyperframes add <name>`. Each item lives in its own directory under `registry/blocks/` or `registry/components/`.
@@ -178,8 +180,13 @@ the item PR if you cannot upload its hosted image.
 ## Pull Requests
 
 - Use [conventional commit](https://www.conventionalcommits.org/) format for **all commits** (e.g., `feat: add timeline export`, `fix: resolve seek overflow`). Enforced by a git hook.
+- Every commit must have a verified signature. Configure GPG or SSH signing with [GitHub's commit-signing guide](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits), use `git commit -S`, and check that GitHub marks the commit **Verified**.
 - CI must pass before merge (build, typecheck, tests, semantic PR title)
-- PRs require at least 1 approval
+- PRs require at least one approving review from a maintainer with write access.
+
+For a single unsigned commit on your own PR branch, sign it with `git commit --amend --no-edit -S`, then update the branch with `git push --force-with-lease`. If the branch has multiple unsigned commits, each needs signing; amending only the last one leaves the others unsigned.
+
+Fork PRs may show **Workflows awaiting approval** before CI runs. A repository maintainer must [approve those workflow runs](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/approve-runs-from-forks); pending checks at this stage do not indicate a test failure. An approving PR review is a separate requirement.
 
 ## Packages
 
@@ -198,14 +205,12 @@ All packages use **fixed versioning** — every release bumps all packages to th
 ### Stable releases
 
 ```bash
-bun run release:prepare 0.2.0        # drafts changelog if needed, then creates the release commit/tag after review
-git push origin main                  # push the release commit
-git push origin v0.2.0                # push the tag → triggers the publish workflow
+git switch -c release/v0.2.0 origin/main
+bun run release:prepare 0.2.0        # drafts release notes and stops for review; rerun after editing them
+git push origin release/v0.2.0       # push the branch, not the local tag
 ```
 
-> Push the **specific tag**, not `git push --tags` — the latter pushes every local tag and the whole push is rejected if any one already exists on the remote.
-
-The `release:prepare` script drafts missing release notes on the first run and stops for manual review. After the generated TODO summary is rewritten, rerun the same command; it delegates to `set-version`, which creates a `chore: release v<version>` commit and a `v<version>` git tag. Pushing the tag triggers CI to publish all packages to npm and create a GitHub Release.
+Open a PR from `release/v0.2.0` to `main`. When it merges, the publish workflow tags the merge commit, publishes every package to npm and creates the GitHub Release. Pushing a stable tag by hand publishes nothing: the workflow only accepts pre-release tags. The full procedure, including recovery from a failed publish, is in [docs/contributing/changelog-process.mdx](docs/contributing/changelog-process.mdx).
 
 `set-version` also refuses to tag if a **higher** semver tag already exists (a stale higher tag would hijack tag-sorting installers like `npx skills`). Delete the stray tag (`git tag -d <tag> && git push origin :refs/tags/<tag>`) or, only if intentional, pass `--skip-monotonicity-check`.
 

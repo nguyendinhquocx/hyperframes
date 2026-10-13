@@ -1,6 +1,8 @@
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { readdirSync, type Dirent } from "node:fs";
-import { realpath, resolveWithinProject } from "@hyperframes/core/safe-path";
+import { realpath, resolveWithinProject as resolveInProject } from "@hyperframes/core/safe-path";
+import { STUDIO_MANUAL_EDITS_PATH } from "./manualEditsRenderScript.js";
+import { STUDIO_MOTION_PATH } from "./studioMotionRenderScript.js";
 
 // `isSafePath` lives at the package root so non-studio-api layers (compiler,
 // CLI, engine) can share it without a backwards dependency on studio-api.
@@ -12,8 +14,13 @@ export {
   mkdirWithinProject,
   realpath,
   realProjectRoot,
-  resolveWithinProject,
 } from "@hyperframes/core/safe-path";
+
+/** Core's `resolveWithinProject`, closed to the desktop app's private files for every route a request path reaches. */
+export function resolveWithinProject(base: string, relativePath: string): string | null {
+  const resolved = resolveInProject(base, relativePath);
+  return resolved && !isPrivateProjectFile(base, resolved) ? resolved : null;
+}
 
 /** The real path; for a path not there (yet, or any more), the nearest existing folder's real path plus the rest. */
 export function realFilePath(filePath: string): string {
@@ -25,12 +32,42 @@ export function realFilePath(filePath: string): string {
   }
 }
 
+// `.hyperframes/` holds the desktop app's and the CLI's own records (a hand-off, chat history, read marks): no route
+// reaches any of it, the folder itself included, but Studio's own files and the app's request pictures.
+const STUDIO_FILES = new Set([STUDIO_MOTION_PATH, STUDIO_MANUAL_EDITS_PATH]);
+const STUDIO_FOLDERS = [".hyperframes/prepared-assets", ".hyperframes/requests"];
+
+/** For a project-relative path with `/` separators. */
+export function isPrivateProjectPath(relPath: string): boolean {
+  const path = relPath.toLowerCase();
+  return (
+    (path === ".hyperframes" || path.startsWith(".hyperframes/")) &&
+    !STUDIO_FILES.has(path) &&
+    !STUDIO_FOLDERS.some((folder) => path === folder || path.startsWith(`${folder}/`))
+  );
+}
+
+export function isPrivateProjectFile(projectDir: string, filePath: string): boolean {
+  const rel = (from: string, to: string) => relative(from, to).split(sep).join("/");
+  return [rel(projectDir, filePath), rel(realFilePath(projectDir), realFilePath(filePath))].some(
+    isPrivateProjectPath,
+  );
+}
+
 /**
  * `resolveWithinProject` with every link inside the project resolved now, so a write to the result lands on the
  * file checked here even if a link on the way is retargeted before the write.
  */
 export function pinWithinProject(base: string, relativePath: string): string | null {
-  const checked = resolveWithinProject(base, relativePath);
+  return pinResolved(base, resolveWithinProject(base, relativePath));
+}
+
+/** `pinWithinProject` for the app's and the CLI's own records under `.hyperframes/`, which no route serves. */
+export function pinProjectRecord(base: string, relativePath: string): string | null {
+  return pinResolved(base, resolveInProject(base, relativePath));
+}
+
+function pinResolved(base: string, checked: string | null): string | null {
   if (!checked) return null;
   const inside = relative(realFilePath(base), realFilePath(checked));
   const escapes = inside === ".." || inside.startsWith(`..${sep}`) || isAbsolute(inside);

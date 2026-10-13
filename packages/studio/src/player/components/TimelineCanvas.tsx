@@ -16,7 +16,9 @@ export const TimelineCanvas = memo(function TimelineCanvas() {
   const props = state.canvas;
   const { draggedClip, scrollRef, displayTrackOrder } = props;
   const draggedRowIndex =
-    draggedClip?.started === true ? displayTrackOrder.indexOf(draggedClip.previewTrack) : -1;
+    draggedClip?.started === true
+      ? (draggedClip.insertRow ?? displayTrackOrder.indexOf(draggedClip.previewTrack))
+      : -1;
   const dropTrackIndex = props.dropPreview
     ? displayTrackOrder.indexOf(props.dropPreview.track)
     : -1;
@@ -83,7 +85,7 @@ export const TimelineCanvas = memo(function TimelineCanvas() {
           data-active={ghostLaneActive || undefined}
           className={`pointer-events-none absolute flex items-center justify-center rounded-lg border border-dashed text-[11px] transition-colors duration-150 ${
             ghostLaneActive
-              ? "border-studio-accent/60 bg-studio-accent/6 text-studio-accent"
+              ? "border-studio-accent/60 bg-studio-accent/6 text-accent-ink"
               : "border-neutral-700/50 text-neutral-500"
           }`}
           style={{
@@ -114,6 +116,7 @@ export const TimelineCanvas = memo(function TimelineCanvas() {
         return visibleIntervals.map((gap) => (
           <div
             key={`gap-${strip.kind}-${strip.track}-${gap.start}`}
+            data-timeline-zoom-scale={-gap.start * props.pps}
             className="pointer-events-none absolute"
             style={{
               top: props.rowGeometry.getRowTop(rowIndex) + CLIP_Y,
@@ -132,6 +135,7 @@ export const TimelineCanvas = memo(function TimelineCanvas() {
           lane + snapped start), parallel to the ghost. Hidden in insert mode. */}
       {draggedClip?.started && draggedClip.insertRow == null && draggedRowIndex >= 0 && (
         <div
+          data-testid="timeline-drag-landing"
           className="absolute pointer-events-none"
           style={{
             top: props.rowGeometry.getRowTop(draggedRowIndex) + CLIP_Y,
@@ -168,7 +172,7 @@ export const TimelineCanvas = memo(function TimelineCanvas() {
 
       {/* Insertion line — a new track will be inserted at this boundary on drop.
           Shown while the pointer is near a lane boundary (insert mode). */}
-      {insertLineRow != null && (
+      {insertLineRow != null && !draggedClip?.started && (
         <div
           data-testid="timeline-insert-line"
           className="absolute pointer-events-none"
@@ -211,6 +215,8 @@ export const TimelineCanvas = memo(function TimelineCanvas() {
         scrollRef={scrollRef}
         pixelsPerSecond={props.pps}
         rowHeight={draggedClipHeight}
+        rowGeometry={props.rowGeometry}
+        contentOrigin={props.contentOrigin}
         selectedElementId={props.selectedElementId}
         currentTime={props.currentTime}
         theme={props.theme}
@@ -241,6 +247,9 @@ export const TimelineCanvas = memo(function TimelineCanvas() {
       {/* Range highlight */}
       {props.rangeSelection && (
         <div
+          data-timeline-zoom-scale={
+            -Math.min(props.rangeSelection.start, props.rangeSelection.end) * props.pps
+          }
           className="absolute pointer-events-none"
           style={{
             left:

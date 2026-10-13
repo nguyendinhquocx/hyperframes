@@ -7,6 +7,8 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  utimesSync,
+  watch,
   writeFileSync,
 } from "node:fs";
 import type { AddressInfo } from "node:net";
@@ -27,7 +29,9 @@ import { consumeCommandResult } from "../utils/commandResult.js";
 import { historyDeps, withOwner } from "../utils/historyOwner.js";
 import historyCommand from "./history.js";
 
-const pause = (ms: number) => new Promise((settle) => setTimeout(settle, ms));
+/** History's clock, a day ahead of the file system's, so each write is dated by the mtime it is stamped with. */
+const clock = { at: 0 };
+const advance = (ms: number) => void (clock.at += ms);
 
 const tracked = vi.hoisted(() => [] as Array<{ action: string; via: string }>);
 vi.mock("../telemetry/events.js", () => ({
@@ -52,7 +56,13 @@ function project() {
   historyDeps.historyRoot = tempDir("hf-history-cli-root-");
   historyDeps.findServer = async () => null;
   historyDeps.turnIdleMs = 60_000;
-  const write = (path: string, text: string) => writeFileSync(join(dir, path), text);
+  historyDeps.ownerWaitMs = undefined;
+  clock.at = Date.now() + 86_400_000;
+  historyDeps.now = () => clock.at;
+  const write = (path: string, text: string) => {
+    writeFileSync(join(dir, path), text);
+    utimesSync(join(dir, path), clock.at / 1000, clock.at / 1000);
+  };
   const read = (path: string) => readFileSync(join(dir, path), "utf-8");
   const files = () => [read("index.html"), read("notes.html")];
   async function hf(...args: string[]) {
@@ -83,6 +93,7 @@ async function preview(dir: string) {
   const history = await openProjectHistory({
     projectDir: dir,
     historyRoot: historyDeps.historyRoot,
+    now: () => historyDeps.now(),
     quietMs: 20,
   });
   const adapter = {
@@ -145,7 +156,7 @@ describe.each(["direct", "preview"])("hyperframes history (%s)", (mode) => {
 
   it("an agent's labelled turn, a person's edit after it: --since shows both, undo of the turn keeps the edit", async () => {
     const { json, hf, turn, personWrites, files } = await setup();
-    const startedAt = new Date(Date.now() - 1).toISOString();
+    const startedAt = new Date(clock.at - 1).toISOString();
     await turn("claude", "Bigger title", "index.html", "A2");
     await personWrites("notes.html", "N2");
 
@@ -173,7 +184,7 @@ describe.each(["direct", "preview"])("hyperframes history (%s)", (mode) => {
     historyDeps.turnIdleMs = 300;
     await hf("begin", "--who", "claude", "--label", "Retitle");
     write("index.html", "A2");
-    await pause(600);
+    advance(600);
     await personWrites("notes.html", "N2");
 
     const undo = await hf("undo", "--who", "claude");
@@ -295,7 +306,7 @@ describe("hyperframes history, one owner", () => {
       who: { kind: "agent", name: "claude" },
       label: "Retitle",
       startedAt: 1,
-      lastWriteAt: Date.now(),
+      lastWriteAt: clock.at,
     };
     writeFileSync(join(dir, ".hyperframes", "history-turn.json"), JSON.stringify(turn));
     write("index.html", "A2");
@@ -336,12 +347,12 @@ describe("hyperframes history, one owner", () => {
     historyDeps.turnIdleMs = 1000;
     // Each write 600 ms after the one before, past 1000 ms in all.
     await hf("begin", "--who", "claude", "--label", "Retitle");
-    await pause(600);
+    advance(600);
     write("index.html", "2");
     await hf(); // a command mid-turn files the turn so far; the rest counts from index.html
-    await pause(600);
+    advance(600);
     write("notes.html", "2");
-    await pause(600);
+    advance(600);
     write("extra.html", "2");
     await hf("end");
     const entries = (await json()).entries.reverse();
@@ -360,7 +371,7 @@ describe("hyperframes history, one owner", () => {
     await turn("claude", "Earlier", "notes.html", "N2");
     await hf("begin", "--who", "claude", "--label", "Retitle");
     // The only change lands past the idle limit (the person's edit over the agent's), so it is Outside.
-    await pause(700);
+    advance(700);
     write("index.html", "A2");
 
     const refused = await hf("undo", "--who", "claude");
@@ -420,6 +431,15 @@ describe("hyperframes history, one owner", () => {
     const home = tempDir("hf-history-cli-home-");
     const historyRoot = join(home, ".cache", "hyperframes", "history");
     const held = await openProjectHistory({ projectDir: dir, historyRoot });
+    // The CLI's first try at the lock leaves a claim draft beside owner.pid: proof it found the history held.
+    const triedLock = new Promise<void>((tried) => {
+      const watcher = watch(join(historyRoot, held.projectId), (_event, name) => {
+        if (!name?.startsWith("owner.pid-")) return;
+        watcher.close();
+        tried();
+      });
+      onTestFinished(() => watcher.close());
+    });
     write("index.html", "A2");
     const cli = resolve(fileURLToPath(import.meta.url), "..", "..", "cli.ts");
     const child = spawn("bun", ["run", cli, "history", "--dir", dir], {
@@ -431,9 +451,15 @@ describe("hyperframes history, one owner", () => {
         HYPERFRAMES_NO_TELEMETRY: "1",
       },
     });
+    onTestFinished(() => void child.kill());
     const exited = new Promise<number | null>((done) => child.on("exit", done));
     const logFile = join(historyRoot, held.projectId, "log.jsonl");
-    await new Promise((settle) => setTimeout(settle, 1500));
+    await Promise.race([
+      triedLock,
+      exited.then((code) => {
+        throw new Error(`the CLI exited (${code}) before trying the held lock`);
+      }),
+    ]);
     expect(
       readFileSync(logFile, "utf-8").trim().split("\n"),
       "nothing written while held",
@@ -478,6 +504,131 @@ describe("hyperframes history, refusals", () => {
     expect(read("added.html")).toBe("new");
   });
 
+  it.each(["direct", "preview"])(
+    "begin --exclusive starts once another agent's turn has been idle (%s)",
+    async (mode) => {
+      const { dir, hf } = project();
+      await hf();
+      if (mode === "preview") await preview(dir);
+      historyDeps.turnIdleMs = 300;
+      await hf("begin", "--who", "codex", "--label", "Retitle");
+      advance(1_000);
+
+      const begun = await hf("begin", "--who", "claude", "--label", "Notes", "--exclusive");
+      expect([begun.code, begun.err]).toEqual([0, ""]);
+      expect((await hf("end", "--who", "claude")).code).toBe(0);
+    },
+  );
+
+  it("begin --exclusive through a preview refuses another agent's open turn", async () => {
+    const { dir, hf } = project();
+    await hf();
+    await preview(dir);
+    await hf("begin", "--who", "codex", "--label", "Retitle");
+    const refused = await hf("begin", "--who", "claude", "--label", "Notes", "--exclusive");
+    expect([refused.code, refused.err]).toEqual([
+      2,
+      "codex's turn is open; it has to end before yours begins",
+    ]);
+  });
+
+  it("begin --exclusive through a preview lets only one of two agents win", async () => {
+    const { dir, hf } = project();
+    await hf();
+    await preview(dir);
+    const begin = (who: string) =>
+      withOwner(dir, async (owner) => {
+        await owner.begin({ kind: "agent", name: who }, who, true);
+      }).then(
+        () => "won",
+        (error: Error) => error.message,
+      );
+    const results = await Promise.all([begin("codex"), begin("claude")]);
+    expect(results.filter((result) => result === "won")).toHaveLength(1);
+    expect(results.find((result) => result !== "won")).toMatch(
+      /^(codex|claude)'s turn is open; it has to end before yours begins$/,
+    );
+  });
+
+  it("begin --exclusive refuses another agent's open turn and keeps it open", async () => {
+    const { write, hf, json } = project();
+    await hf();
+    await hf("begin", "--who", "codex", "--label", "Retitle");
+    write("index.html", "A2");
+
+    const refused = await hf("begin", "--who", "claude", "--label", "Notes", "--exclusive");
+    expect([refused.code, refused.err]).toEqual([
+      2,
+      "codex's turn is open; it has to end before yours begins",
+    ]);
+    expect((await hf("end", "--who", "codex")).code).toBe(0);
+    const entries = (await json()).entries as Array<{ who: { name: string }; files: string[] }>;
+    expect(entries.filter((entry) => entry.who.name === "codex")).toMatchObject([
+      { files: ["index.html"] },
+    ]);
+  });
+
+  it("serializes concurrent begin --exclusive claims under the history owner lock", async () => {
+    const { dir } = project();
+    const historyRoot = tempDir("hf-history-cli-root-");
+    const held = await openProjectHistory({ projectDir: dir, historyRoot });
+    const home = join(historyRoot, held.projectId);
+    const claimers = new Set<string>();
+    const bothWaiting = new Promise<void>((resolveWaiting) => {
+      const inspect = (_event: string, name: string | null) => {
+        const pid = name?.match(/^owner\.pid-(\d+)-/)?.[1];
+        if (pid) claimers.add(pid);
+        if (claimers.size < 2) return;
+        watcher.close();
+        resolveWaiting();
+      };
+      const watcher = watch(home, inspect);
+      onTestFinished(() => watcher.close());
+    });
+    const cli = resolve(fileURLToPath(import.meta.url), "..", "..", "cli.ts");
+    const begin = (who: string) => {
+      const child = spawn(
+        "bun",
+        ["run", cli, "history", "begin", "--who", who, "--label", who, "--exclusive", "--dir", dir],
+        {
+          env: {
+            ...process.env,
+            HYPERFRAMES_HISTORY_ROOT: historyRoot,
+            HYPERFRAMES_SKIP_UPDATE_CHECK: "1",
+            HYPERFRAMES_NO_TELEMETRY: "1",
+          },
+        },
+      );
+      onTestFinished(() => void child.kill());
+      return new Promise<{ code: number | null; error: string }>((done) => {
+        let error = "";
+        child.stderr.on("data", (chunk) => (error += chunk));
+        child.on("exit", (code) => done({ code, error: error.trim() }));
+      });
+    };
+    const results = [begin("codex"), begin("claude")];
+    await bothWaiting;
+    await held.close();
+
+    const settled = await Promise.all(results);
+    expect(settled.map((result) => result.code).sort()).toEqual([0, 2]);
+    expect(settled.find((result) => result.code === 2)?.error).toMatch(
+      /'s turn is open; it has to end before yours begins$/,
+    );
+  });
+
+  it("end --who refuses another agent's turn, and --if-open succeeds with none open", async () => {
+    const { hf, json } = project();
+    await hf();
+    expect(await json("end", "--if-open")).toMatchObject({ entry: null, parts: [] });
+    expect((await hf("end")).code).toBe(2);
+
+    await hf("begin", "--who", "codex", "--label", "Retitle");
+    const refused = await hf("end", "--who", "claude", "--if-open");
+    expect([refused.code, refused.err]).toEqual([2, "The open turn is codex's, not claude's"]);
+    expect((await hf("end", "--who", "codex")).code).toBe(0);
+  });
+
   it("--json refusals go to stdout as {ok: false, error}", async () => {
     const { hf } = project();
     await hf();
@@ -499,15 +650,63 @@ describe("hyperframes history, refusals", () => {
     expect(readdirSync(historyDeps.historyRoot)).toEqual([]);
   });
 
-  it("exits 2 with the holder's pid when another process keeps the history past the wait", async () => {
-    const { dir, hf } = project();
-    await openProjectHistory({ projectDir: dir, historyRoot: historyDeps.historyRoot }).then(
-      (held) => onTestFinished(() => held.close()),
-    );
-    const busy = await hf();
-    expect([busy.code, busy.err]).toEqual([
+  it("reads the history while another app keeps it open, and refuses to change it there", async () => {
+    const { dir, read, hf, turn } = project();
+    await hf();
+    const first = await turn("claude", "Retitle", "index.html", "A2");
+    await turn("claude", "Again", "index.html", "A3");
+    await hf("begin", "--who", "codex", "--label", "Open turn");
+    const marker = () => readFileSync(join(dir, ".hyperframes", "history-turn.json"), "utf-8");
+    const before = marker();
+    const held = await openProjectHistory({
+      projectDir: dir,
+      historyRoot: historyDeps.historyRoot,
+    });
+    onTestFinished(() => held.close());
+    historyDeps.ownerWaitMs = 0;
+
+    const listed = await hf("--json", "--limit", "2");
+    expect(listed.code).toBe(0);
+    const labels = JSON.parse(listed.out).entries.map((entry: { label: string }) => entry.label);
+    expect(labels).toEqual(["Again", "Retitle"]);
+    expect((await hf("show", first.id)).out).toContain("M index.html");
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await hf("peek", first.id, "index.html");
+    expect(String(stdout.mock.calls[0]?.[0])).toBe("A2");
+    stdout.mockRestore();
+    expect(marker()).toBe(before);
+
+    const refused = await hf("undo", first.id);
+    expect([refused.code, refused.err]).toEqual([
       2,
-      `This project's history is open in another process (pid ${process.pid}).`,
+      `This project is open in another app (pid ${process.pid}), which keeps its history: undo, restore or pin there.`,
     ]);
-  }, 15_000);
+    expect(read("index.html")).toBe("A3");
+  });
+
+  it("still refuses a history id it cannot read, instead of reading the history as empty", async () => {
+    const { dir, hf } = project();
+    mkdirSync(join(dir, ".hyperframes"), { recursive: true });
+    writeFileSync(join(dir, ".hyperframes", "history-id"), "garbage\n");
+    const refused = await hf();
+    expect(refused.code).toBe(2);
+    expect(refused.err).toContain("holds no history id this version can read");
+  });
+
+  it("peek refuses cleanly when another app pruned the point's file after its log was read", async () => {
+    const { dir, hf, turn } = project();
+    await hf();
+    const first = await turn("claude", "Retitle", "index.html", "A2");
+    const held = await openProjectHistory({
+      projectDir: dir,
+      historyRoot: historyDeps.historyRoot,
+    });
+    onTestFinished(() => held.close());
+    historyDeps.ownerWaitMs = 0;
+    const hash = held.peek(first.id)!["index.html"]!;
+    rmSync(join(historyDeps.historyRoot, held.projectId, "blobs", hash.slice(0, 2), hash));
+
+    const refused = await hf("peek", first.id, "index.html");
+    expect([refused.code, refused.err]).toEqual([2, "That point is no longer kept"]);
+  });
 });

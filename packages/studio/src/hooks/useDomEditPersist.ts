@@ -6,6 +6,7 @@ import type { PersistDomEditOperations } from "./domEditCommitTypes";
 import type { PatchOperation } from "../utils/sourcePatcher";
 import {
   DomEditPersistUnsafeValueError,
+  DomEditPersistPreparedWriteError,
   DomEditPersistUnresolvableError,
   warnDomEditPersistNoOp,
 } from "./domEditPersistFailure";
@@ -14,17 +15,15 @@ import {
   postPatchElement,
   writePreparedContent,
 } from "./useDomEditCommitsHelpers";
+import { importedFontFaceCssFor } from "../utils/studioFontHelpers";
+import { countStudioManualEditSave } from "../components/editor/manualEditsDom";
 import type { CutoverResult } from "../utils/sdkCutover";
 import { reseekPreviewRuntime } from "./timelineTrackVisibility";
 import { serializeStudioFileMutations } from "../utils/studioFileMutationCoordinator";
 import { readProjectFileContent } from "../utils/studioFileHistory";
 
-export interface RecordEditInput {
-  label: string;
-  coalesceKey?: string;
-  coalesceMs?: number;
-  files: Record<string, { before: string; after: string }>;
-}
+import type { RecordEditInput } from "../utils/studioFileHistory";
+export type { RecordEditInput } from "../utils/studioFileHistory";
 
 export interface UseDomEditPersistParams {
   activeCompPath: string | null;
@@ -77,7 +76,8 @@ export function useDomEditPersist({
 
       const targetPath = selection.sourceFile || activeCompPath || "index.html";
       const completePersistence = <T>(result: T, changed: boolean): T => {
-        if (options?.skipRefresh && changed) reseekPreviewRuntime(previewIframeRef.current);
+        if (options?.skipRefresh && changed && !options.deferRender)
+          reseekPreviewRuntime(previewIframeRef.current);
         return result;
       };
 
@@ -94,7 +94,12 @@ export function useDomEditPersist({
       // after it let invalid numeric values bypass the guard whenever the
       // cutover flag was on.
       const patchTarget = buildDomEditPatchTarget(selection);
-      const patchBody = { target: patchTarget, operations };
+      const font = options?.importedFont;
+      const patchBody = {
+        target: patchTarget,
+        operations,
+        ...(font ? { fontFaceCss: importedFontFaceCssFor(font, targetPath) } : {}),
+      };
       const unsafeFields = findUnsafeDomPatchValues(patchBody);
       if (unsafeFields.length > 0) {
         const fields = formatUnsafeFieldList(unsafeFields);
@@ -104,11 +109,9 @@ export function useDomEditPersist({
         });
       }
 
-      // Skip the SDK path when prepareContent is set (e.g. @font-face injection
-      // for a custom font): sdkCutoverPersist serializes only the patched DOM
-      // and would drop the injected content. Let the server path run prepareContent.
-      // The SDK joins the file queue itself and re-reads there; this read is only its fallback.
-      if (onTrySdkPersist && !options?.prepareContent) {
+      // An imported font or prepareContent takes the server patch; the SDK serializes only the patched
+      // DOM. The SDK re-reads in the file queue; this read is its fallback.
+      if (onTrySdkPersist && !font && !options?.prepareContent) {
         const originalContent = await readTarget();
         if (originalContent === null) return;
         const cutover = await onTrySdkPersist(selection, operations, originalContent, targetPath, {
@@ -133,6 +136,7 @@ export function useDomEditPersist({
         coalesceMs: options?.coalesceMs,
       };
       const prepare = options?.prepareContent;
+      let preparedWriteFailed = false;
       // Read, server patch, follow-up write and history hold the file's queue, so no save lands between them.
       const saved = await serializeStudioFileMutations(writeProjectFile, [targetPath], async () => {
         const originalContent = await readTarget();
@@ -142,7 +146,7 @@ export function useDomEditPersist({
 
         const patchedContent =
           typeof patchData.content === "string" ? patchData.content : originalContent;
-        const finalContent = prepare
+        const prepared = prepare
           ? await writePreparedContent(
               targetPath,
               patchedContent,
@@ -150,10 +154,23 @@ export function useDomEditPersist({
               writeProjectFile,
               showToast,
             )
-          : patchedContent;
+          : { content: patchedContent, failed: false };
+        preparedWriteFailed = prepared.failed;
+        const finalContent = prepared.content;
 
         await editHistory.recordEdit({
           ...history,
+          targets: [
+            {
+              file: targetPath,
+              ...(selection.id && { id: selection.id }),
+              ...(selection.hfId && { hfId: selection.hfId }),
+              ...(selection.selector && { selector: selection.selector }),
+              ...(selection.selectorIndex !== undefined && {
+                selectorIndex: selection.selectorIndex,
+              }),
+            },
+          ],
           files: { [targetPath]: { before: originalContent, after: finalContent } },
         });
         return { patchData, patchedContent, finalContent };
@@ -188,7 +205,7 @@ export function useDomEditPersist({
       if (!options?.skipRefresh) {
         reloadPreview();
       }
-      return completePersistence(
+      const outcome = completePersistence(
         finalContent === patchedContent &&
           typeof patchData.path === "string" &&
           typeof patchData.version === "string"
@@ -196,6 +213,8 @@ export function useDomEditPersist({
           : undefined,
         true,
       );
+      if (preparedWriteFailed) throw new DomEditPersistPreparedWriteError(targetPath);
+      return outcome;
     },
     [
       activeCompPath,
@@ -214,9 +233,12 @@ export function useDomEditPersist({
     (selection, operations, options) => {
       const expectedProjectId = projectIdRef.current;
       if (!expectedProjectId) return Promise.reject(new Error("No active project"));
-      return queueDomEditSave(() =>
-        performPersistDomEditOperations(selection, operations, options, expectedProjectId),
-      );
+      // Counted, so a preview reload requested before this save settles is not shown over it.
+      const save = () =>
+        queueDomEditSave(() =>
+          performPersistDomEditOperations(selection, operations, options, expectedProjectId),
+        );
+      return selection.element ? countStudioManualEditSave(selection.element, save) : save();
     },
     [performPersistDomEditOperations, projectIdRef, queueDomEditSave],
   );

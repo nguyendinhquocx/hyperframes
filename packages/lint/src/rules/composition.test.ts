@@ -912,16 +912,119 @@ describe("composition rules", () => {
       expect(result.findings.find((f) => f.code === "missing_data_no_timeline")).toBeUndefined();
     });
 
-    it("does not warn when a script registers window.__timelines[id]", async () => {
+    it.each([
+      'window.__timelines["c1"] = gsap.timeline({ paused: true });',
+      "window.__timelines.c1 = gsap.timeline({ paused: true });",
+      "window.__timelines = { c1: gsap.timeline({ paused: true }) };",
+      'window.__timelines = { "c1": gsap.timeline({ paused: true }) };',
+      'const spec = { id: "c1" }; window.__timelines[spec.id] = gsap.timeline({ paused: true });',
+      'window.__timelines["c1"] ??= gsap.timeline({ paused: true });',
+      'window.__timelines["c1"] ||= gsap.timeline({ paused: true });',
+      'const ids = ["c1"]; window.__timelines[ids[0]] = gsap.timeline({ paused: true });',
+    ])("does not warn when a script registers a timeline: %s", async (registration) => {
       const html = `<!DOCTYPE html><html><body>
   <div data-composition-id="c1" data-width="320" data-height="180" data-duration="5"></div>
   <script>
     window.__timelines = window.__timelines || {};
-    window.__timelines["c1"] = gsap.timeline({ paused: true });
+    ${registration}
   </script>
 </body></html>`;
       const result = await lintHyperframeHtml(html);
       expect(result.findings.find((f) => f.code === "missing_data_no_timeline")).toBeUndefined();
+    });
+
+    it("warns for each bare nested composition id without a timeline or opt-out", async () => {
+      const html = `<!DOCTYPE html><html><body>
+  <div data-composition-id="root" data-width="320" data-height="180" data-duration="5">
+    <section id="alpha" data-composition-id="alpha"></section>
+    <section id="beta" data-composition-id="beta"></section>
+  </div>
+  <script>window.__timelines["root"] = gsap.timeline({ paused: true });</script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const findings = result.findings.filter((f) => f.code === "missing_data_no_timeline");
+
+      expect(findings).toHaveLength(2);
+      expect(findings.map((finding) => finding.elementId)).toEqual(["alpha", "beta"]);
+      expect(findings[0]?.message).toContain('Composition host "alpha"');
+      expect(findings[0]?.fixHint).toContain("plain `id`");
+    });
+
+    it("ignores a timeline registration that only appears in a script comment", async () => {
+      const html = `<!DOCTYPE html><html><body>
+  <div data-composition-id="root" data-width="320" data-height="180" data-duration="5">
+    <section data-composition-id="static"></section>
+  </div>
+  <script>
+    window.__timelines["root"] = gsap.timeline({ paused: true });
+    // window.__timelines["static"] = timeline;
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+
+      expect(result.findings.find((f) => f.code === "missing_data_no_timeline")?.message).toContain(
+        'Composition host "static"',
+      );
+    });
+
+    it("accepts nested hosts with registrations, sources, or explicit opt-outs", async () => {
+      const html = `<!DOCTYPE html><html><body>
+  <div data-composition-id="root" data-width="320" data-height="180" data-duration="5">
+    <section data-composition-id="registered"></section>
+    <section data-composition-id="static" data-no-timeline></section>
+    <section data-composition-id="source" data-composition-src="source.html"></section>
+    <section data-composition-id="compiled" data-composition-file="compiled.html"></section>
+  </div>
+  <script>
+    window.__timelines.root = gsap.timeline({ paused: true });
+    window.__timelines.registered = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+
+      expect(result.findings.find((f) => f.code === "missing_data_no_timeline")).toBeUndefined();
+    });
+
+    it("does not guess which host a computed timeline key registers", async () => {
+      const html = `<!DOCTYPE html><html><body>
+  <div data-composition-id="root" data-width="320" data-height="180" data-duration="5">
+    <section data-composition-id="scene"></section>
+  </div>
+  <script>
+    const compositionId = "scene";
+    window.__timelines[compositionId] = (gsap.timeline({ paused: true }));
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+
+      expect(result.findings.find((f) => f.code === "missing_data_no_timeline")).toBeUndefined();
+    });
+
+    it("checks bare nested hosts inside a sub-composition file", async () => {
+      const html = `<template>
+  <div data-composition-id="scene" data-width="320" data-height="180" data-duration="5">
+    <section data-composition-id="static-part"></section>
+  </div>
+</template>`;
+      const result = await lintHyperframeHtml(html, { isSubComposition: true });
+
+      expect(result.findings.find((f) => f.code === "missing_data_no_timeline")?.message).toContain(
+        'Composition host "static-part"',
+      );
+    });
+
+    it.each([
+      "window.__timelines = {};",
+      '// window.__timelines["c1"] = gsap.timeline({ paused: true });',
+    ])("still warns when a script does not register a timeline: %s", async (script) => {
+      const html = `<!DOCTYPE html><html><body>
+  <div data-composition-id="c1" data-width="320" data-height="180" data-duration="5"></div>
+  <script>${script}</script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(result.findings.find((f) => f.code === "missing_data_no_timeline")).toMatchObject({
+        severity: "warning",
+      });
     });
 
     it("does not warn when there is no root composition-id", async () => {
@@ -1244,65 +1347,108 @@ describe("composition rules", () => {
   describe("invalid_parent_traversal_in_asset_path", () => {
     const RULE_CODE = "invalid_parent_traversal_in_asset_path";
 
-    it("errors when an <img> src uses ../capture/", async () => {
-      const html = `<html><body>
-        <div data-composition-id="x">
-          <img src="../capture/assets/logo.svg" alt="logo">
-        </div>
-      </body></html>`;
-      const result = await lintHyperframeHtml(html, {
-        filePath: "/project/compositions/scene.html",
-      });
-      const finding = result.findings.find((f) => f.code === RULE_CODE);
-      expect(finding).toBeDefined();
+    const lintAt = (compSrcPath: string, body: string) =>
+      lintHyperframeHtml(`<html><body><div data-composition-id="x">${body}</div></body></html>`, {
+        compSrcPath,
+      }).then((result) => result.findings.find((f) => f.code === RULE_CODE));
+
+    it("errors when the root file's <img> src climbs out of the project with ../capture/", async () => {
+      const finding = await lintAt("index.html", `<img src="../capture/assets/logo.svg" alt="">`);
       expect(finding?.severity).toBe("error");
       expect(finding?.message).toContain("../capture/");
     });
 
-    it("errors when a <video> src uses ../assets/ (HF#1698 shape)", async () => {
-      const html = `<html><body>
-        <div data-composition-id="x">
-          <video src="../assets/clip.mp4" muted></video>
-        </div>
-      </body></html>`;
-      const result = await lintHyperframeHtml(html, {
-        filePath: "/project/compositions/scene.html",
-      });
-      const finding = result.findings.find((f) => f.code === RULE_CODE);
-      expect(finding).toBeDefined();
-      expect(finding?.severity).toBe("error");
-      expect(finding?.message).toContain("../assets/");
+    it("accepts ../assets/ from compositions/scene.html: it resolves to the project's assets/", async () => {
+      expect(
+        await lintAt("compositions/scene.html", `<video src="../assets/clip.mp4" muted></video>`),
+      ).toBeUndefined();
     });
 
-    it("errors when a <video> src uses ../../assets/ from a nested compositions/frames/ file", async () => {
-      const html = `<html><body>
-        <div data-composition-id="x">
-          <video src="../../assets/clip.mp4" muted></video>
-        </div>
-      </body></html>`;
-      const result = await lintHyperframeHtml(html, {
-        filePath: "/project/compositions/frames/scene.html",
-      });
-      const finding = result.findings.find((f) => f.code === RULE_CODE);
-      expect(finding).toBeDefined();
+    it("errors when ../../assets/ from compositions/scene.html climbs out of the project", async () => {
+      const finding = await lintAt(
+        "compositions/scene.html",
+        `<video src="../../assets/clip.mp4" muted></video>`,
+      );
       expect(finding?.message).toContain("../../assets/");
     });
 
-    it("errors when a <link> href uses ../fonts/", async () => {
+    it("resolves from a nested compositions/frames/ file's own folder", async () => {
+      const nested = "compositions/frames/scene.html";
+      expect(
+        await lintAt(nested, `<video src="../../assets/clip.mp4" muted></video>`),
+      ).toBeUndefined();
+      expect(await lintAt(nested, `<img src="../../../x.png" alt="">`)).toBeDefined();
+    });
+
+    it("errors on an encoded or backslashed climb out of the project", async () => {
+      const scene = "compositions/scene.html";
+      expect(await lintAt(scene, `<img src="../%2E%2e/x.png" alt="">`)).toBeDefined();
+      expect(await lintAt(scene, `<img src="../..\\x.png" alt="">`)).toBeDefined();
+    });
+
+    it("errors on a climb from the root file however its first segment is written", async () => {
+      for (const src of ["%2e%2e/x.png", "..\\x.png", "assets/../../x.png", "&#46;&#46;/x.png"]) {
+        expect(await lintAt("index.html", `<img src="${src}" alt="">`)).toBeDefined();
+      }
+    });
+
+    it("counts an absolute or ..-containing file path's folder as the project root", async () => {
+      for (const file of [
+        "/srv/project/index.html",
+        "C:\\project\\index.html",
+        "sub/../index.html",
+      ]) {
+        expect(await lintAt(file, `<img src="../x.png" alt="">`)).toBeDefined();
+      }
+    });
+
+    it("reads an encoded %2f as a separator, as render decodes it", async () => {
+      expect(
+        await lintAt("compositions/scene.html", `<img src="..%2f..%2fx.png" alt="">`),
+      ).toBeDefined();
+    });
+
+    it("never counts a file path's leading .. below the project root", async () => {
+      expect(await lintAt("../x/scene.html", `<img src="../y.png" alt="">`)).toBeUndefined();
+    });
+
+    it("ignores URLs with a scheme, absolute paths and fragments", async () => {
+      for (const src of ["https://cdn.example.com/../../x.png", "/../x.png", "#../x"]) {
+        expect(await lintAt("index.html", `<img src="${src}" alt="">`)).toBeUndefined();
+      }
+    });
+
+    it("ignores a path's query and hash", async () => {
+      expect(
+        await lintAt("compositions/scene.html", `<img src="../assets/x.png#/../../../../" alt="">`),
+      ).toBeUndefined();
+    });
+
+    it("treats a file linted without compSrcPath as the project root", async () => {
+      const { findings } = await lintHyperframeHtml(
+        `<html><body><div data-composition-id="x"><img src="../x.png" alt=""></div></body></html>`,
+      );
+      expect(findings.map((f) => f.code)).toContain(RULE_CODE);
+    });
+
+    it("errors when a path dips out of the project midway or the file path starts with ./", async () => {
+      const scene = "compositions/scene.html";
+      expect(await lintAt(scene, `<img src="../assets/../../x.png" alt="">`)).toBeDefined();
+      expect(await lintAt(`./${scene}`, `<img src="../../x.png" alt="">`)).toBeDefined();
+    });
+
+    it("errors when a <link> href climbs out of the project with ../fonts/", async () => {
       const html = `<html><head>
         <link rel="stylesheet" href="../fonts/brand.css">
       </head><body>
         <div data-composition-id="x"></div>
       </body></html>`;
-      const result = await lintHyperframeHtml(html, {
-        filePath: "/project/compositions/scene.html",
-      });
+      const result = await lintHyperframeHtml(html, { compSrcPath: "index.html" });
       const finding = result.findings.find((f) => f.code === RULE_CODE);
-      expect(finding).toBeDefined();
       expect(finding?.message).toContain("../fonts/");
     });
 
-    it("errors when a CSS url() uses ../assets/ in a <style> block (counts all occurrences)", async () => {
+    it("errors when CSS url()s in a <style> block climb out of the project (counts all occurrences)", async () => {
       const html = `<html><body>
         <style>
           @font-face { font-family: 'Brand'; src: url('../fonts/Brand.woff2'); }
@@ -1310,25 +1456,16 @@ describe("composition rules", () => {
         </style>
         <div data-composition-id="x"></div>
       </body></html>`;
-      const result = await lintHyperframeHtml(html, {
-        filePath: "/project/compositions/scene.html",
-      });
+      const result = await lintHyperframeHtml(html, { compSrcPath: "index.html" });
       const finding = result.findings.find((f) => f.code === RULE_CODE);
-      expect(finding).toBeDefined();
       expect(finding?.message).toContain("2 asset path(s)");
     });
 
-    it("errors when an inline style url() uses ../assets/", async () => {
-      const html = `<html><body>
-        <div data-composition-id="x">
-          <div style="background-image: url('../assets/hero.png');"></div>
-        </div>
-      </body></html>`;
-      const result = await lintHyperframeHtml(html, {
-        filePath: "/project/compositions/scene.html",
-      });
-      const finding = result.findings.find((f) => f.code === RULE_CODE);
-      expect(finding).toBeDefined();
+    it("errors when an inline style url() climbs out of the project", async () => {
+      const finding = await lintAt(
+        "index.html",
+        `<div style="background-image: url('../assets/hero.png');"></div>`,
+      );
       expect(finding?.message).toContain("../assets/");
     });
 
@@ -2483,6 +2620,56 @@ ${body}
         wrap("#a { z-index: -1; } #b { z-index: -2; }", `    <div id="a"></div>`),
       );
       expect(result.findings.filter((f) => f.code === "negative_z_index")).toHaveLength(2);
+    });
+  });
+
+  describe("subcomposition_root_styled_by_class", () => {
+    it("flags when the root class is used as a CSS selector in a sub-composition", async () => {
+      const html = `<!doctype html><html><body>
+        <style>
+          .my-root { background: red; }
+        </style>
+        <div data-composition-id="main" class="my-root" data-start="0" data-duration="5"></div>
+      </body></html>`;
+
+      const result = await lintHyperframeHtml(html, { isSubComposition: true });
+      expect(result.findings).toContainEqual(
+        expect.objectContaining({
+          code: "subcomposition_root_styled_by_class",
+          severity: "error",
+        }),
+      );
+    });
+
+    it("passes when styling via #root and descendant selectors", async () => {
+      const html = `<!doctype html><html><body>
+        <style>
+          #root { background: red; }
+          .child { color: blue; }
+        </style>
+        <div data-composition-id="main" id="root" class="my-root" data-start="0" data-duration="5">
+          <div class="child"></div>
+        </div>
+      </body></html>`;
+
+      const result = await lintHyperframeHtml(html, { isSubComposition: true });
+      expect(result.findings.some((f) => f.code === "subcomposition_root_styled_by_class")).toBe(
+        false,
+      );
+    });
+
+    it("passes if it is not a sub-composition", async () => {
+      const html = `<!doctype html><html><body>
+        <style>
+          .my-root { background: red; }
+        </style>
+        <div data-composition-id="main" class="my-root" data-start="0" data-duration="5"></div>
+      </body></html>`;
+
+      const result = await lintHyperframeHtml(html, { isSubComposition: false });
+      expect(result.findings.some((f) => f.code === "subcomposition_root_styled_by_class")).toBe(
+        false,
+      );
     });
   });
 });

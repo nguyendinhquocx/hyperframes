@@ -116,6 +116,20 @@ describe("describeProject", () => {
     ]);
   });
 
+  it("reports each half's out-of-sync offset from its source pair, at the project fps", async () => {
+    const { rows, text } = await rowsOf(`<html><body>
+<div data-composition-id="main" data-duration="10" data-fps="24">
+  <video id="v" src="t.mp4" muted data-sync-origin="lk-1" data-start="1" data-duration="4" data-track-index="0"></video>
+  <audio id="a" src="t.mp4" data-sync-origin="lk-1" data-start="1.5" data-duration="4" data-track-index="1"></audio>
+  <audio id="m" src="m.mp3" data-start="0" data-duration="4" data-track-index="2"></audio>
+</div></body></html>`);
+    const offset = (id: string) => rows.find((r) => r.id === id)?.syncOffsetFrames;
+    expect(offset("a")).toBe(12);
+    expect(offset("v")).toBe(-12);
+    expect(offset("m")).toBeNull();
+    expect(text).toContain("out-of-sync=+12f");
+  });
+
   it("reports unreadable automation instead of showing no lanes", async () => {
     const bad = (await describeProject(project())).tracks
       .flatMap((t) => t.rows)
@@ -376,6 +390,80 @@ describe("absolute main-timeline time", () => {
     // Host starts at 5 and the runtime adds the raw -3: it plays at 2, not at the clamped 5.
     expect(rows.find((r) => r.id === "nested")).toMatchObject({ absStart: 2, absEnd: 4 });
   });
+
+  it.each([
+    {
+      basis: "global",
+      start: -1,
+      duration: 3,
+      absoluteStart: -1,
+      absoluteEnd: 2,
+      expectedBar: "█".repeat(16) + " ".repeat(24),
+    },
+    {
+      basis: "local",
+      start: -2,
+      duration: 3,
+      absoluteStart: -1,
+      absoluteEnd: 2,
+      expectedBar: "█".repeat(16) + " ".repeat(24),
+    },
+    {
+      basis: "global",
+      start: -0.001,
+      duration: 1.001,
+      absoluteStart: -0.001,
+      absoluteEnd: 1,
+      expectedBar: "█".repeat(8) + " ".repeat(32),
+    },
+    {
+      basis: "global",
+      start: -2,
+      duration: 10,
+      absoluteStart: -2,
+      absoluteEnd: 8,
+      expectedBar: "█".repeat(40),
+    },
+    {
+      basis: "global",
+      start: 0,
+      duration: 3,
+      absoluteStart: 0,
+      absoluteEnd: 3,
+      expectedBar: "█".repeat(24) + " ".repeat(16),
+    },
+    {
+      basis: "global",
+      start: 1,
+      duration: 3,
+      absoluteStart: 1,
+      absoluteEnd: 4,
+      expectedBar: " ".repeat(8) + "█".repeat(24) + " ".repeat(8),
+    },
+  ])(
+    "prints a bounded bar for $basis media at $start without changing timing",
+    async ({ basis, start, duration, absoluteStart, absoluteEnd, expectedBar }) => {
+      dir = tempDir("hf-timeline-bar-");
+      mkdirSync(join(dir, "compositions"));
+      writeFileSync(
+        join(dir, "index.html"),
+        '<div data-composition-id="main" data-duration="5"><div id="host" data-composition-src="compositions/scene.html" data-start="1" data-duration="3"></div></div>',
+      );
+      writeFileSync(
+        join(dir, "compositions", "scene.html"),
+        `<div data-composition-id="scene"><audio id="voice" data-start="${start}" data-duration="${duration}" data-hf-media-start-basis="${basis}"></audio></div>`,
+      );
+      const timeline = await describeProject(join(dir, "index.html"));
+      const voice = allRows(timeline).find((row) => row.id === "voice");
+      expect(voice).toMatchObject({ absStart: absoluteStart, absEnd: absoluteEnd });
+
+      const output = formatTimeline(timeline);
+      const line = output.split("\n").find((line) => line.includes("#voice voice"));
+      expect(line).toContain(`|${expectedBar}|`);
+      expect(line).toContain(`voice ${absoluteStart}-${absoluteEnd}s`);
+      expect(voice).toMatchObject({ absStart: absoluteStart, absEnd: absoluteEnd });
+    },
+  );
 
   it("resolves a media start given as an expression like any other clip, not as a literal", async () => {
     dir = tempDir("hf-timeline-expr-");

@@ -1,6 +1,7 @@
+import { editsPlainCss } from "../../hooks/gsapRuntimeKeyframes";
 import type { DomEditSelection } from "./domEditingTypes";
 import { readStudioBoxSize } from "./manualEdits";
-import { readMoveOffset } from "./plainTranslate";
+import { readMoveOffset, UNREADABLE_TRANSLATE } from "./plainTranslate";
 import { parsePxMetricValue, type PropertyPanelProps } from "./propertyPanelHelpers";
 
 interface TransformCommitDeps {
@@ -70,16 +71,20 @@ export function createTransformCommitHandlers({
       await commitAnimatedTransformValue(
         axis,
         parsed,
-        "This element's position can't be edited here yet — it is driven by its animation",
+        "This element's position can't be edited here yet: its animation drives it",
       )
     )
       return;
-    const current = readMoveOffset(element.element);
+    const plainTranslate = editsPlainCss(element.element, "move");
+    const current = readMoveOffset(element.element, plainTranslate);
+    if (!Number.isFinite(current.x) || !Number.isFinite(current.y))
+      return void showToast?.(UNREADABLE_TRANSLATE);
     await Promise.resolve(
-      onSetManualOffset(element, {
-        x: axis === "x" ? parsed : current.x,
-        y: axis === "y" ? parsed : current.y,
-      }),
+      onSetManualOffset(
+        element,
+        { x: axis === "x" ? parsed : current.x, y: axis === "y" ? parsed : current.y },
+        { plainTranslate },
+      ),
     );
   };
 
@@ -92,7 +97,7 @@ export function createTransformCommitHandlers({
       return;
     }
     if (hasGsapAnimation) {
-      showToast?.("This element's size can't be edited here yet — it is driven by its animation");
+      showToast?.("This element's size can't be edited here yet: its animation drives it");
       return;
     }
     const current = readStudioBoxSize(element.element);
@@ -119,7 +124,7 @@ export function createTransformCommitHandlers({
       await commitAnimatedTransformValue(
         "rotation",
         parsed,
-        "This element's rotation can't be edited here yet — it is driven by its animation",
+        "This element's rotation can't be edited here yet: its animation drives it",
       )
     )
       return;

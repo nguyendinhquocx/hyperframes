@@ -1,5 +1,10 @@
 export { createStudioApi } from "./createStudioApi.js";
-export { createProjectSignature, affectsProjectSignature } from "./helpers/projectSignature.js";
+export { MAX_UPLOAD_BYTES } from "./routes/files.js";
+export {
+  createProjectSignature,
+  affectsProjectSignature,
+  STUDIO_SIGNATURE_MANIFEST_PATHS,
+} from "./helpers/projectSignature.js";
 export { compositionsAffectedBy } from "./helpers/compositionInputs.js";
 export { affectsPreview } from "./helpers/previewReads.js";
 export * from "./history/index.js";
@@ -37,7 +42,7 @@ export type { PreviewApiAdapter } from "./helpers/mediaProxyPreview.js";
 export { PREVIEW_BUNDLE_OPTIONS } from "./routes/preview.js";
 export { createPreviewDocumentStore } from "./helpers/previewDocumentStore.js";
 export { getMimeType, MIME_TYPES } from "./helpers/mime.js";
-export { requestSubPath } from "./helpers/requestSubPath.js";
+export { decodeWellFormedEscapes, requestSubPath } from "./helpers/requestSubPath.js";
 export {
   consumeFileWriteReceipt,
   identifyFileWrite,
@@ -47,7 +52,11 @@ export {
   type FileWriteReceipt,
 } from "./helpers/fileVersion.js";
 export { buildSubCompositionHtml } from "./helpers/subComposition.js";
-export { getElementScreenshotClip, type ScreenshotClip } from "./helpers/screenshotClip.js";
+export {
+  clearElementScreenshotIsolation,
+  getElementScreenshotClip,
+  type ScreenshotClip,
+} from "./helpers/screenshotClip.js";
 export {
   thumbnailDeviceScaleFactor,
   type ThumbnailOutputDimensions,

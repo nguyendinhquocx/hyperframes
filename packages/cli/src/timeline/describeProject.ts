@@ -8,7 +8,9 @@ import {
 import { HF_AUDIO_FX_ATTR, parseAudioFxChain } from "@hyperframes/core/audio-fx";
 import { HF_AUDIO_GROUP_ATTR } from "@hyperframes/core/audio-groups";
 import { byStart, type ClipFact, type ClipLane } from "@hyperframes/core/clip-facts";
-import { parseNumeric } from "@hyperframes/core";
+import { fpsToNumber, parseFpsWithDefault, parseNumeric } from "@hyperframes/core";
+import { findSyncPartner, readLinkTiming, syncOffsetFrames } from "@hyperframes/core/media-link";
+import { readCompositionFps } from "../utils/compositionFps.js";
 import {
   readMediaOffsetSeconds,
   readPlaybackRate,
@@ -22,7 +24,13 @@ import {
   type StructureNode,
   type TrackKind,
 } from "@hyperframes/parsers";
-import { resolveMediaStartSeconds } from "@hyperframes/core/media-timing";
+import {
+  compositionOriginSeconds,
+  cutToHostSlots,
+  hostInPointSeconds,
+  resolveMediaStartSeconds,
+  type HostSlot,
+} from "@hyperframes/core/media-timing";
 import {
   extractAudioMetadata,
   extractMediaMetadata,
@@ -45,7 +53,8 @@ export interface TimelineRow extends ClipFact {
   pendingReason: string | null;
   /** Why `data-automation` / `data-fx-chain` could not be read; `null` when fine or absent. */
   laneError: string | null;
-  /** Start and end on the main timeline, in seconds. `start`/`end` are local to the owning file's composition. */
+  /** Main-timeline window in seconds: the played part under an in-point host, while `duration` stays
+   * the authored length. `start`/`end` are local to the owning file's composition. */
   absStart: number;
   absEnd: number;
   /** Project-relative path of the file that declares this clip. */
@@ -60,6 +69,8 @@ export interface TimelineRow extends ClipFact {
   hostRow: RowPointer | null;
   /** Where this row's sub-composition clips are (one level only); each is a full row in its kind's `rows`. */
   children: RowPointer[];
+  /** Signed frames from its `data-sync-origin` partner (+ = late); `null` unpaired or rates differ. */
+  syncOffsetFrames: number | null;
 }
 
 export interface RowPointer {
@@ -129,7 +140,7 @@ interface DocScope {
   startCache: Map<Element, number>;
   /** Sub-composition files must stay inside the project. */
   projectDir: string;
-  /** Main-timeline start of this document's root: 0 for index.html, the host's start for a sub-composition. */
+  /** Main-timeline time of this document's local t=0: 0 for index.html, see `compositionOriginSeconds`. */
   origin: number;
   /** Project-relative path of this document, with `/` separators. */
   file: string;
@@ -137,6 +148,7 @@ interface DocScope {
   withProbeSlot: <T>(fn: () => Promise<T>) => Promise<T>;
   measure: MeasureMedia;
   sourceOverrides: ReadonlyMap<string, string>;
+  fps: number;
 }
 
 /** Source length in seconds of a media file. ffprobe in production; tests pass a recorded fake. */
@@ -272,7 +284,12 @@ async function resolveRowTiming(scope: DocScope, node: DomNode, depth: number): 
   const authored = resolveReferencedDuration(scope.doc, el, scope.startCache, new Set());
   const host = el.getAttribute("data-composition-src");
   const absStart = mainTimelineStart(scope, el, start);
-  const children = host && depth === 0 ? await readSubComposition(host, scope, absStart) : [];
+  const slots: HostSlot[] =
+    hostInPointSeconds(el) > 0 ? [{ start: absStart, end: absStart + (authored ?? Infinity) }] : [];
+  const children =
+    host && depth === 0
+      ? await readSubComposition(host, scope, compositionOriginSeconds(absStart, el), slots)
+      : [];
   const kind = el.tagName.toLowerCase();
   const duration = MEDIA_TAG.test(kind)
     ? await resolveMediaRowDuration(scope, el, kind as MediaTag, authored)
@@ -312,7 +329,13 @@ function describeRowFields(scope: DocScope, node: DomNode, timing: RowTiming): C
     warnings: [],
     elementId: el.id || null,
     hfId: el.getAttribute("data-hf-id"),
+    syncOffsetFrames: syncOffsetOf(el, scope.fps),
   };
+}
+
+function syncOffsetOf(el: Element, fps: number): number | null {
+  const partner = findSyncPartner(el);
+  return partner ? syncOffsetFrames(readLinkTiming(el), readLinkTiming(partner), fps) : null;
 }
 
 async function describeRow(scope: DocScope, node: DomNode, depth: number): Promise<ClipDraft> {
@@ -323,6 +346,7 @@ async function readSubComposition(
   src: string,
   parent: DocScope,
   origin: number,
+  slots: readonly HostSlot[],
 ): Promise<ClipDraft[]> {
   const authored = resolve(parent.dir, src);
   const file = realFileInside(parent.projectDir, authored);
@@ -343,11 +367,18 @@ async function readSubComposition(
     withProbeSlot: parent.withProbeSlot,
     measure: parent.measure,
     sourceOverrides: parent.sourceOverrides,
+    fps: parent.fps,
   };
   const rows = await Promise.all(
     topLevelElements(toNode(root)).map((node) => describeRow(scope, node, 1)),
   );
-  return rows.sort(byStart);
+  return rows.flatMap((row) => cutRow(row, slots)).sort(byStart);
+}
+
+function cutRow(row: ClipDraft, slots: readonly HostSlot[]): ClipDraft[] {
+  const kept = cutToHostSlots({ start: row.absStart, end: row.absEnd }, slots);
+  if (kept.end === kept.start && row.absEnd > row.absStart) return [];
+  return [{ ...row, absStart: roundMs(kept.start), absEnd: roundMs(kept.end) }];
 }
 
 /** The file's real path when it is a regular file inside the project (symlinks resolved), else null. */
@@ -416,6 +447,11 @@ function flatten(top: ClipDraft[]): TimelineTrack[] {
   }));
 }
 
+function projectFps(source: string): number {
+  const parsed = parseFpsWithDefault(readCompositionFps(source) ?? undefined);
+  return fpsToNumber(parsed.ok ? parsed.value : { num: 30, den: 1 });
+}
+
 /** Needs a global DOMParser (`ensureDOMParser`). Reads `index.html` and one level of sub-compositions. */
 export async function describeProject(
   indexPath: string,
@@ -437,6 +473,7 @@ export async function describeProject(
     withProbeSlot: createProbeGate(PROBE_CONCURRENCY),
     measure,
     sourceOverrides,
+    fps: projectFps(source),
   };
   const rows = (
     await Promise.all(topLevelElements(toNode(root)).map((node) => describeRow(scope, node, 0)))

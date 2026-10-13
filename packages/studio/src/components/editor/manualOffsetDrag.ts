@@ -1,3 +1,4 @@
+import { isHtmlElement } from "@hyperframes/core/runtime/dom-realm";
 import type { DomEditSelection } from "./domEditing";
 import {
   applyStudioPathOffset,
@@ -6,20 +7,22 @@ import {
   captureStudioPathOffset,
   clearStudioPathOffset,
   endStudioManualEditGesture,
+  isStudioManualEditGestureCurrent,
   readAppliedStudioPathOffset,
   restoreStudioPathOffset,
   type StudioPathOffsetSnapshot,
 } from "./manualEdits";
+import type { EditMoment } from "./manualEditsTypes";
 import { computeDraggedGsapPosition } from "../../hooks/draggedGsapPosition";
-import { gsapWritesPosition } from "../../hooks/gsapRuntimeKeyframes";
-import { readTranslatePx, writeTranslatePx } from "./plainTranslate";
+import { editsPlainCss } from "../../hooks/gsapRuntimeKeyframes";
+import { readTranslatePx, UNREADABLE_TRANSLATE, writeTranslatePx } from "./plainTranslate";
 
 interface OffsetDragGsap {
   set: (el: Element, vars: Record<string, number | string>) => void;
   getProperty: (el: Element, prop: string) => number;
 }
 
-function getOffsetDragGsap(element: HTMLElement): OffsetDragGsap | null {
+export function getOffsetDragGsap(element: HTMLElement): OffsetDragGsap | null {
   const win = element.ownerDocument.defaultView as
     | (Window & { gsap?: Partial<OffsetDragGsap> })
     | null;
@@ -51,27 +54,6 @@ function applyOffsetDragDraftViaGsap(
   const { newX, newY } = computeDraggedGsapPosition(element, offset, baseGsap);
   gsap.set(element, { x: newX, y: newY });
   return true;
-}
-
-/**
- * Live rotation preview through the GSAP channel — the SAME channel the commit
- * lands in (a `tl.set`/keyframe rotation), mirroring `applyOffsetDragDraftViaGsap`.
- * GSAP owns the transform rotation, so neutralize the CSS `rotate` longhand to keep
- * the two channels from composing. `angle` is the absolute target rotation. Returns
- * false when gsap is unavailable (caller falls back to the CSS draft).
- */
-export function applyRotationDraftViaGsap(element: HTMLElement, angle: number): boolean {
-  const gsap = getOffsetDragGsap(element);
-  if (!gsap) return false;
-  element.style.setProperty("rotate", "none");
-  gsap.set(element, { rotation: angle });
-  return true;
-}
-
-/** Current GSAP transform rotation — the single-source rotation base. 0 if gsap is unavailable. */
-export function readGsapRotation(element: HTMLElement): number {
-  const gsap = getOffsetDragGsap(element);
-  return gsap ? Number(gsap.getProperty(element, "rotation")) || 0 : 0;
 }
 
 const DEFAULT_OFFSET_PROBE_PX = 100;
@@ -152,9 +134,7 @@ function getFrameElement(win: Window): HTMLElement | null {
   try {
     const frameElement = win.frameElement;
     if (!frameElement) return null;
-    const ownerWin = frameElement.ownerDocument.defaultView;
-    const htmlElement = ownerWin?.HTMLElement;
-    return htmlElement && frameElement instanceof htmlElement ? frameElement : null;
+    return isHtmlElement(frameElement) ? frameElement : null;
   } catch {
     return null;
   }
@@ -166,12 +146,12 @@ function getRectCenter(element: HTMLElement): Point | null {
     return null;
   }
 
-  let point = {
-    x: rect.left + rect.width / 2,
-    y: rect.top + rect.height / 2,
-  };
+  const point = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  return toTopScreenPoint(element.ownerDocument, point);
+}
 
-  let win: Window | null = element.ownerDocument.defaultView;
+export function toTopScreenPoint(doc: Document, point: Point): Point | null {
+  let win: Window | null = doc.defaultView;
   while (win) {
     const frameElement = getFrameElement(win);
     if (!frameElement) break;
@@ -186,7 +166,6 @@ function getRectCenter(element: HTMLElement): Point | null {
     };
     win = frameElement.ownerDocument.defaultView;
   }
-
   return point;
 }
 
@@ -337,14 +316,17 @@ export function createManualOffsetDragMember(input: {
   selection: DomEditSelection;
   element: HTMLElement;
   rect: ManualOffsetDragRect;
-  gesture?: "drag" | "nudge"; // a resize's anchor member keeps the legacy offset channel
+  gesture?: "drag" | "nudge" | "resize"; // resize: the anchor that keeps its centre planted
+  at?: EditMoment;
 }): ManualOffsetDragMemberResult {
-  const plainTranslate = !!input.gesture && !gsapWritesPosition(input.element);
-  // Base the drag on the offset ACTUALLY applied, never a dormant var (readAppliedStudioPathOffset),
-  // so a stale offset can't fling the element off-screen.
+  const plainTranslate =
+    !!input.gesture && editsPlainCss(input.element, input.gesture === "resize" ? "resize" : "move");
+  // The APPLIED offset, never a dormant var, so a stale one can't fling the element off-screen.
   const initialOffset = plainTranslate
     ? readTranslatePx(input.element)
     : readAppliedStudioPathOffset(input.element);
+  if (!finitePoint(initialOffset))
+    return { ok: false, reason: UNREADABLE_TRANSLATE, selection: input.selection };
   const win = input.element.ownerDocument.defaultView as
     | (Window & {
         gsap?: { getProperty?: (el: Element, prop: string) => number };
@@ -375,17 +357,19 @@ export function createManualOffsetDragMember(input: {
   }
 
   const initialPathOffset = captureStudioPathOffset(input.element);
-  const gestureToken = beginStudioManualEditGesture(input.element);
+  const gestureToken = beginStudioManualEditGesture(
+    input.element,
+    input.gesture === "resize" ? "resize" : "move",
+    input.at,
+  );
   const measured = measureManualOffsetDragScreenToOffsetMatrix(input.element, initialOffset, {
     scaleX: input.rect.editScaleX,
     scaleY: input.rect.editScaleY,
     plainTranslate,
   });
   if (!measured.ok) {
-    // Fallback: when GSAP transforms interfere with probe measurement, use
-    // the preview scale as an approximation. The commit path reads the actual
-    // GSAP position from the iframe runtime, so visual imprecision during
-    // drag is acceptable — the final committed position is always exact.
+    // GSAP transforms can defeat the probe: approximate with the preview scale. The commit
+    // reads GSAP's real position, so only the drag preview is imprecise.
     const scaleX = input.rect.editScaleX || 1;
     const scaleY = input.rect.editScaleY || 1;
     const w = readTransformWDivisor(input.element);
@@ -466,7 +450,7 @@ export function applyManualOffsetDragDraft(
  * the element flies off-screen the instant you drop it. The member holds the
  * true gesture-start values in JS, immune to the re-render.
  */
-function stampGestureBase(el: HTMLElement, initialOffset: Point, baseGsap: Point): void {
+export function stampGestureBase(el: HTMLElement, initialOffset: Point, baseGsap: Point): void {
   el.setAttribute("data-hf-drag-gsap-base-x", String(baseGsap.x));
   el.setAttribute("data-hf-drag-gsap-base-y", String(baseGsap.y));
   el.setAttribute("data-hf-drag-initial-offset-x", String(initialOffset.x));
@@ -551,6 +535,7 @@ function settleDraftTranslate(element: HTMLElement, gsapOwnsPosition: boolean): 
 /** Teardown after a COMMITTED drag. */
 export function endManualOffsetDragMembers(members: ManualOffsetDragMember[]): void {
   for (const member of members) {
+    if (!isStudioManualEditGestureCurrent(member.element, member.gestureToken)) continue;
     endStudioManualEditGesture(member.element, member.gestureToken);
     member.element.removeAttribute("data-hf-drag-initial-offset-x");
     member.element.removeAttribute("data-hf-drag-initial-offset-y");

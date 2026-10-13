@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants, createReadStream, renameSync } from "node:fs";
 import { copyFile, mkdir, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { atomicTempPath } from "@hyperframes/core/atomic-file";
 
 /** File contents stored once by sha256, text and binary alike. */
 export interface BlobStore {
@@ -18,6 +19,14 @@ export interface BlobStore {
 
 const BLOB_HASH = /^[0-9a-f]{64}$/;
 
+function blobPath(dir: string, hash: string): string {
+  // Checked where the path is joined, so no caller can read or write outside the store.
+  if (!BLOB_HASH.test(hash)) throw new Error("That is not a history blob.");
+  return join(dir, hash.slice(0, 2), hash);
+}
+
+export const readBlob = (dir: string, hash: string) => readFile(blobPath(dir, hash));
+
 async function hashFile(path: string): Promise<string> {
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(path)) hash.update(chunk);
@@ -26,7 +35,7 @@ async function hashFile(path: string): Promise<string> {
 
 async function cloneOrCopy(from: string, to: string, beforeReplace?: () => void): Promise<void> {
   await mkdir(dirname(to), { recursive: true });
-  const temp = `${to}.${randomUUID()}.tmp`;
+  const temp = atomicTempPath(to);
   try {
     await copyFile(from, temp, constants.COPYFILE_FICLONE);
     beforeReplace?.();
@@ -43,11 +52,7 @@ export async function openBlobStore(dir: string): Promise<BlobStore> {
   for (const shard of await readdir(dir))
     for (const hash of await readdir(join(dir, shard)).catch(() => []))
       sizes.set(hash, (await stat(join(dir, shard, hash))).size);
-  const pathOf = (hash: string) => {
-    // Checked where the path is joined, so no caller can read or write outside the store.
-    if (!BLOB_HASH.test(hash)) throw new Error("That is not a history blob.");
-    return join(dir, hash.slice(0, 2), hash);
-  };
+  const pathOf = (hash: string) => blobPath(dir, hash);
   let total = [...sizes.values()].reduce((sum, size) => sum + size, 0);
 
   return {
@@ -70,7 +75,7 @@ export async function openBlobStore(dir: string): Promise<BlobStore> {
       return hash;
     },
     has: (hash) => sizes.has(hash),
-    read: async (hash) => readFile(pathOf(hash)),
+    read: async (hash) => readBlob(dir, hash),
     writeTo: async (hash, absPath, beforeReplace) =>
       cloneOrCopy(pathOf(hash), absPath, beforeReplace),
     bytes: () => total,

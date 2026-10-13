@@ -72,7 +72,7 @@ export function FlatRow({
           <button
             type="button"
             data-flat-row-reset="true"
-            title="Remove — fall back to default"
+            title="Remove and fall back to default"
             onClick={() => {
               track("button", `Reset ${label}`);
               onReset();
@@ -537,7 +537,7 @@ export function FlatSlider({
         <div
           data-flat-slider-knob="true"
           className={`absolute top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full ${
-            tier === "explicitCustom" ? "h-2 w-2 bg-white" : "h-[7px] w-[7px] bg-panel-text-4"
+            tier === "explicitCustom" ? "h-2 w-2 bg-text-0" : "h-[7px] w-[7px] bg-panel-text-4"
           }`}
           style={{ left: `${clampedPct}%` }}
         />
@@ -556,7 +556,7 @@ export function FlatSlider({
             <button
               type="button"
               data-flat-slider-reset="true"
-              title="Remove — fall back to default"
+              title="Remove and fall back to default"
               disabled={disabled}
               onClick={() => {
                 track("button", `Reset ${label}`);

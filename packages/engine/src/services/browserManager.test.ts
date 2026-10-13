@@ -1,7 +1,7 @@
 // fallow-ignore-file code-duplication
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -20,6 +20,7 @@ import {
   buildChromeArgs,
   compositionRequiresWebGpu,
   assertWebGpuAdapterAvailable,
+  usesSoftwareWebGpu,
   WebGpuUnavailableError,
   drainBrowserPool,
   forceReleaseBrowser,
@@ -182,6 +183,13 @@ describe("buildChromeArgs browser GPU mode", () => {
     expect(args).not.toContain("--use-angle=swiftshader");
   });
 
+  it.each(["darwin", "win32", "linux"] as const)(
+    "pins the capture surface to 1 device pixel per CSS pixel on %s",
+    (platform) => {
+      expect(buildChromeArgs({ ...base, platform })).toContain("--force-device-scale-factor=1");
+    },
+  );
+
   it("keeps --disable-gpu authoritative when requested", () => {
     const args = buildChromeArgs(
       { ...base, platform: "darwin" },
@@ -201,6 +209,37 @@ describe("buildChromeArgs browser GPU mode", () => {
   it("is byte-identical to the requiresWebGpu-absent case for a non-declaring composition", () => {
     expect(buildChromeArgs({ ...base, requiresWebGpu: false })).toEqual(buildChromeArgs(base));
   });
+
+  it("runs an opted-in WebGPU composition on SwiftShader's Vulkan with GPU compositing on", () => {
+    const args = buildChromeArgs(
+      { ...base, platform: "linux", requiresWebGpu: true },
+      { browserGpuMode: "software", allowSoftwareWebGpu: true },
+    );
+    expect(args).toContain("--enable-features=CanvasDrawElement,Vulkan");
+    expect(args).not.toContain("--enable-features=CanvasDrawElement");
+    expect(args).toContain("--use-vulkan=swiftshader");
+    expect(args).toContain("--enable-unsafe-webgpu");
+    expect(args).not.toContain("--disable-gpu-compositing");
+  });
+
+  it.each([
+    ["without the opt-in", true, { browserGpuMode: "software" }],
+    [
+      "for a composition without WebGPU",
+      false,
+      { browserGpuMode: "software", allowSoftwareWebGpu: true },
+    ],
+    ["on a GPU", true, { browserGpuMode: "hardware", allowSoftwareWebGpu: true }],
+    ["under --disable-gpu", true, { disableGpu: true, allowSoftwareWebGpu: true }],
+  ] as const)("leaves the launch as it was %s", (_, requiresWebGpu, config) => {
+    expect(usesSoftwareWebGpu(requiresWebGpu, config)).toBe(false);
+    expect(buildChromeArgs({ ...base, platform: "linux", requiresWebGpu }, config)).toEqual(
+      buildChromeArgs(
+        { ...base, platform: "linux", requiresWebGpu },
+        { ...config, allowSoftwareWebGpu: false },
+      ),
+    );
+  });
 });
 
 describe("compositionRequiresWebGpu", () => {
@@ -211,6 +250,16 @@ describe("compositionRequiresWebGpu", () => {
       ),
     ).toBe(true);
     expect(compositionRequiresWebGpu('<div data-composition-id="dom"></div>')).toBe(false);
+  });
+
+  it("finds the root after an inlined script whose code holds '<' and the marker name", () => {
+    const runtime = `<script>if(n<32)q="[data-composition-id]";if(a>b)go()</script>`;
+    expect(
+      compositionRequiresWebGpu(`${runtime}<div data-composition-id="main" data-requires-webgpu>`),
+    ).toBe(true);
+    expect(
+      compositionRequiresWebGpu(`<div title="data-composition-id" data-requires-webgpu>`),
+    ).toBe(false);
   });
 
   it("reads only the composition root tag and stays linear on repeated '<'", () => {
@@ -248,7 +297,7 @@ describe("assertWebGpuAdapterAvailable", () => {
 
   describe("in-page adapter check (real callback, stubbed navigator.gpu)", () => {
     const runInPage = {
-      evaluate: (fn: (t: number) => unknown, t: number) => fn(t),
+      evaluate: (fn: (...args: unknown[]) => unknown, ...args: unknown[]) => fn(...args),
     } as unknown as Page;
     const stubAdapter = (adapter: unknown) =>
       vi.stubGlobal("navigator", { gpu: { requestAdapter: async () => adapter } });
@@ -262,6 +311,14 @@ describe("assertWebGpuAdapterAvailable", () => {
     it("refuses a software fallback adapter such as swiftshader", async () => {
       stubAdapter({ info: { isFallbackAdapter: true } });
       await expect(assertWebGpuAdapterAvailable(runInPage, true)).rejects.toBeInstanceOf(
+        WebGpuUnavailableError,
+      );
+    });
+
+    it("accepts a software fallback adapter only on a launch that runs software WebGPU", async () => {
+      stubAdapter({ info: { isFallbackAdapter: true } });
+      await expect(assertWebGpuAdapterAvailable(runInPage, true, true)).resolves.toBeUndefined();
+      await expect(assertWebGpuAdapterAvailable(runInPage, true, false)).rejects.toBeInstanceOf(
         WebGpuUnavailableError,
       );
     });
@@ -312,6 +369,13 @@ describe("resolveBrowserGpuMode", () => {
     return { close, launch };
   };
 
+  const notWsl = {
+    platform: "linux" as const,
+    release: "6.8.0-45-generic",
+    readProcVersion: () => "Linux version 6.8.0-45-generic",
+    renderNodeAccess: () => ({ state: "read-write" as const }),
+  };
+
   beforeEach(() => {
     _resetAutoBrowserGpuModeCacheForTests();
   });
@@ -320,6 +384,21 @@ describe("resolveBrowserGpuMode", () => {
     vi.restoreAllMocks();
     _setPuppeteerForTests(undefined);
     _resetAutoBrowserGpuModeCacheForTests();
+  });
+
+  it("lets a host own GPU probe launch and cleanup", async () => {
+    const { launch } = setMockWebGlProbe({ hasWebGL: true, vendor: "NVIDIA", renderer: "NVIDIA" });
+    const close = vi.fn(async (browser: Browser) => {
+      await browser.close();
+    });
+    const managedLaunch = vi.fn(
+      async (ppt: PuppeteerNode, options: Parameters<PuppeteerNode["launch"]>[0]) =>
+        ppt.launch(options),
+    );
+    await resolveBrowserGpuMode("auto", { probeLifecycle: { launch: managedLaunch, close } });
+    expect(managedLaunch).toHaveBeenCalledOnce();
+    expect(launch).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
   });
 
   it("passes 'software' through unchanged without probing", async () => {
@@ -342,15 +421,15 @@ describe("resolveBrowserGpuMode", () => {
       renderer: "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device))",
     });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const mode = await resolveBrowserGpuMode("hardware", { platform: "linux" });
+    const mode = await resolveBrowserGpuMode("hardware", { platform: "linux", wslHost: notWsl });
     expect(mode).toBe("hardware");
     const warning = warn.mock.calls.map((call) => String(call[0])).join("\n");
     expect(warning).toContain("browserGpuMode=hardware was requested");
     expect(warning).toContain("--gpus all");
     // Once per process, not once per worker — the render path resolves the
     // mode for the probe browser plus every parallel worker.
-    await resolveBrowserGpuMode("hardware", { platform: "linux" });
-    await resolveBrowserGpuMode("hardware", { platform: "linux" });
+    await resolveBrowserGpuMode("hardware", { platform: "linux", wslHost: notWsl });
+    await resolveBrowserGpuMode("hardware", { platform: "linux", wslHost: notWsl });
     expect(warn).toHaveBeenCalledTimes(1);
   });
 
@@ -368,7 +447,9 @@ describe("resolveBrowserGpuMode", () => {
       renderer: "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device))",
     });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    expect(await resolveBrowserGpuMode("hardware", { platform: "darwin" })).toBe("hardware");
+    expect(await resolveBrowserGpuMode("hardware", { platform: "darwin", wslHost: notWsl })).toBe(
+      "hardware",
+    );
     const warning = String(warn.mock.calls[0]?.[0]);
     expect(warning).toContain("host exposes a GPU");
     expect(warning).not.toContain("--gpus all");
@@ -382,11 +463,151 @@ describe("resolveBrowserGpuMode", () => {
       launch: vi.fn().mockRejectedValue(new Error("spawn ENOENT /bad/chrome")),
     } as unknown as PuppeteerNode);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    expect(await resolveBrowserGpuMode("hardware", { platform: "linux" })).toBe("hardware");
+    expect(await resolveBrowserGpuMode("hardware", { platform: "linux", wslHost: notWsl })).toBe(
+      "hardware",
+    );
     const warning = String(warn.mock.calls[0]?.[0]);
     expect(warning).toContain("GPU probe could not run");
     expect(warning).toContain("hyperframes doctor");
     expect(warning).not.toContain("--gpus all");
+  });
+
+  describe("under WSL (heygen-com/hyperframes#5548)", () => {
+    const wslHost = {
+      platform: "linux" as const,
+      release: "5.15.167.4-microsoft-standard-WSL2",
+      readProcVersion: () => "",
+      renderNodeAccess: () => ({ state: "denied" as const, group: "render", userInGroup: false }),
+    };
+    const output = (spy: { mock: { calls: unknown[][] } }) =>
+      spy.mock.calls.map((call) => String(call[0])).join("\n");
+    const neverAnsweringProbe = () => {
+      const launch = vi.fn().mockResolvedValue({
+        newPage: vi.fn().mockResolvedValue({ evaluate: () => new Promise(() => {}) }),
+        close: () => new Promise(() => {}),
+        process: () => ({ kill: vi.fn() }),
+        disconnect: vi.fn().mockResolvedValue(undefined),
+      });
+      _setPuppeteerForTests({ launch } as unknown as PuppeteerNode);
+    };
+
+    it("auto mode says it fell back to software, why, and the fix, once", async () => {
+      setMockWebGlProbe({ hasWebGL: false, vendor: "", renderer: "" });
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      expect(await resolveBrowserGpuMode("auto", { platform: "linux", wslHost })).toBe("software");
+      await resolveBrowserGpuMode("auto", { platform: "linux", wslHost });
+      const text = output(error);
+      expect(text).toContain("browserGpuMode probe → software (WebGL unavailable)");
+      expect(text).toContain(
+        "WSL: the GPU check found no hardware GPU, so this render uses software",
+      );
+      expect(text).toContain('is not in its group ("render")');
+      expect(text).toContain("sudo usermod -aG render $USER");
+      expect(text.match(/usermod/g)).toHaveLength(1);
+    });
+
+    it("auto mode says the check did not finish when the probe page times out", async () => {
+      vi.useFakeTimers();
+      try {
+        neverAnsweringProbe();
+        const error = vi.spyOn(console, "error").mockImplementation(() => {});
+        const mode = resolveBrowserGpuMode("auto", { platform: "linux", wslHost });
+        await vi.advanceTimersByTimeAsync(15_000 + 250);
+        await expect(mode).resolves.toBe("software");
+        const text = output(error);
+        expect(text).toContain("did not answer within 15000ms");
+        expect(text).toContain("WSL: the GPU check could not finish");
+        expect(text).not.toContain("found no hardware GPU");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("explicit 'hardware' after a timeout stays unverified and never claims software", async () => {
+      vi.useFakeTimers();
+      try {
+        neverAnsweringProbe();
+        const error = vi.spyOn(console, "error").mockImplementation(() => {});
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        const mode = resolveBrowserGpuMode("hardware", { platform: "linux", wslHost });
+        await vi.advanceTimersByTimeAsync(15_000 + 250);
+        await expect(mode).resolves.toBe("hardware");
+        const warning = output(warn);
+        expect(warning).toContain("hardware acceleration is UNVERIFIED");
+        expect(warning).toContain("hyperframes doctor");
+        expect(warning).toContain("sudo usermod -aG render $USER");
+        expect(warning).not.toContain("found no hardware GPU");
+        expect(output(error)).not.toContain("this render uses software");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("explicit 'hardware' with a broken Chrome keeps the Chrome-install advice", async () => {
+      _setPuppeteerForTests({
+        launch: vi.fn().mockRejectedValue(new Error("spawn ENOENT /bad/chrome")),
+      } as unknown as PuppeteerNode);
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      expect(await resolveBrowserGpuMode("hardware", { platform: "linux", wslHost })).toBe(
+        "hardware",
+      );
+      const warning = output(warn);
+      expect(warning).toContain("GPU probe could not run");
+      expect(warning).toContain("hyperframes doctor");
+      expect(warning).not.toContain("--gpus all");
+      expect(output(error)).not.toContain("this render uses software");
+    });
+
+    it("explicit 'hardware' with no hardware GPU gives the WSL fix, not Docker passthrough", async () => {
+      setMockWebGlProbe({ hasWebGL: false, vendor: "", renderer: "" });
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      expect(await resolveBrowserGpuMode("hardware", { platform: "linux", wslHost })).toBe(
+        "hardware",
+      );
+      const warning = output(warn);
+      expect(warning).toContain("sudo usermod -aG render $USER");
+      expect(warning).not.toContain("--gpus all");
+      expect(output(error)).not.toContain("this render uses software");
+    });
+
+    it("stays quiet when WSL hands Chrome a hardware GPU", async () => {
+      setMockWebGlProbe({
+        hasWebGL: true,
+        vendor: "Google Inc. (Microsoft Corporation)",
+        renderer: "ANGLE (Microsoft Corporation, D3D12 (Intel(R) Graphics), OpenGL ES 3.0)",
+      });
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      expect(await resolveBrowserGpuMode("auto", { platform: "linux", wslHost })).toBe("hardware");
+      expect(output(error)).not.toContain("WSL");
+    });
+  });
+
+  it("falls back to 'software' within the probe budget when the probe page never answers", async () => {
+    vi.useFakeTimers();
+    try {
+      const kill = vi.fn();
+      const launch = vi.fn().mockResolvedValue({
+        newPage: vi.fn().mockResolvedValue({ evaluate: () => new Promise(() => {}) }),
+        close: () => new Promise(() => {}),
+        process: () => ({ kill }),
+        disconnect: vi.fn().mockResolvedValue(undefined),
+      });
+      _setPuppeteerForTests({ launch } as unknown as PuppeteerNode);
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      const mode = resolveBrowserGpuMode("auto", { browserTimeout: 120_000 });
+      await vi.advanceTimersByTimeAsync(15_000 + 250);
+
+      await expect(mode).resolves.toBe("software");
+      expect(launch).toHaveBeenCalledWith(
+        expect.objectContaining({ timeout: 120_000, waitForInitialPage: false }),
+      );
+      expect(kill).toHaveBeenCalledWith("SIGKILL");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("falls back to 'software' when the probe browser cannot launch", async () => {
@@ -649,7 +870,7 @@ describe("resolveHeadlessShellPath", () => {
         for (const [directory, executable] of candidates) {
           const binary = join(cacheVersion, directory, executable);
           mkdirSync(join(binary, ".."), { recursive: true });
-          writeFileSync(binary, "");
+          writeFileSync(binary, "shell");
         }
         const expectedBinary = join(cacheVersion, expectedDirectory, expectedExecutable);
 
@@ -690,7 +911,7 @@ describe("resolveHeadlessShellPath", () => {
         ] as const) {
           const binary = join(cacheVersion, directory, executable);
           mkdirSync(join(binary, ".."), { recursive: true });
-          writeFileSync(binary, "");
+          writeFileSync(binary, "shell");
         }
 
         const env = { ...process.env, HOME: home, USERPROFILE: home };
@@ -723,10 +944,10 @@ describe("resolveHeadlessShellPath", () => {
         "chrome-headless-shell",
       );
       mkdirSync(join(binary, ".."), { recursive: true });
-      writeFileSync(binary, "");
+      writeFileSync(binary, "shell");
       const olderBinary = binary.replace("linux-152.0.7928.2", "linux-99.0.1.1");
       mkdirSync(join(olderBinary, ".."), { recursive: true });
-      writeFileSync(olderBinary, "");
+      writeFileSync(olderBinary, "shell");
 
       // os.homedir() reads HOME on POSIX and USERPROFILE on Windows.
       const env = { ...process.env, HOME: home, USERPROFILE: home };
@@ -739,6 +960,75 @@ describe("resolveHeadlessShellPath", () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
+
+  it("skips a cached shell that is a folder or empty and uses the next older build", () => {
+    const home = mkdtempSync(join(tmpdir(), "hyperframes-engine-browser-empty-"));
+    try {
+      const shell = (version: string) =>
+        join(
+          home,
+          ".cache",
+          "hyperframes",
+          "chrome",
+          "chrome-headless-shell",
+          `linux-${version}`,
+          "chrome-headless-shell-linux64",
+          "chrome-headless-shell",
+        );
+      mkdirSync(shell("153.0.7990.1"), { recursive: true });
+      for (const [version, content] of [
+        ["152.0.7977.30", ""],
+        ["150.0.7871.124", "shell"],
+      ]) {
+        mkdirSync(join(shell(version), ".."), { recursive: true });
+        writeFileSync(shell(version), content);
+      }
+      const env = { ...process.env, HOME: home, USERPROFILE: home };
+      delete env.PRODUCER_HEADLESS_SHELL_PATH;
+      delete env.HYPERFRAMES_BROWSER_PATH;
+      const stdout = resolveHeadlessShellInSubprocess(env, { platform: "linux", arch: "x64" });
+
+      expect(stdout).toBe(shell("150.0.7871.124"));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // Permission bits do not stop root, and Windows ignores them.
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "keeps scanning past a cached build it cannot read",
+    () => {
+      const home = mkdtempSync(join(tmpdir(), "hyperframes-engine-browser-unreadable-"));
+      const shell = (version: string) =>
+        join(
+          home,
+          ".cache",
+          "hyperframes",
+          "chrome",
+          "chrome-headless-shell",
+          `linux-${version}`,
+          "chrome-headless-shell-linux64",
+          "chrome-headless-shell",
+        );
+      const lockedDir = join(shell("152.0.7977.30"), "..");
+      try {
+        for (const version of ["152.0.7977.30", "150.0.7871.124"]) {
+          mkdirSync(join(shell(version), ".."), { recursive: true });
+          writeFileSync(shell(version), "shell");
+        }
+        chmodSync(lockedDir, 0o000);
+        const env = { ...process.env, HOME: home, USERPROFILE: home };
+        delete env.PRODUCER_HEADLESS_SHELL_PATH;
+        delete env.HYPERFRAMES_BROWSER_PATH;
+        const stdout = resolveHeadlessShellInSubprocess(env, { platform: "linux", arch: "x64" });
+
+        expect(stdout).toBe(shell("150.0.7871.124"));
+      } finally {
+        chmodSync(lockedDir, 0o755);
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("skips managed-cache builds newer than Chrome 150 on macOS 12", () => {
     const home = mkdtempSync(join(tmpdir(), "hyperframes-engine-browser-macos12-"));
@@ -756,7 +1046,7 @@ describe("resolveHeadlessShellPath", () => {
         );
       for (const version of ["152.0.7977.30", "150.0.7871.124"]) {
         mkdirSync(join(shell(version), ".."), { recursive: true });
-        writeFileSync(shell(version), "");
+        writeFileSync(shell(version), "shell");
       }
       const env = { ...process.env, HOME: home, USERPROFILE: home };
       delete env.PRODUCER_HEADLESS_SHELL_PATH;

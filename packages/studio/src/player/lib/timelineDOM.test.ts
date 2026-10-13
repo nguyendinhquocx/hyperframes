@@ -281,6 +281,37 @@ describe("parseTimelineFromDOM — hfId from data-hf-id", () => {
 
     expect(element.hidden).toBe(true);
   });
+
+  it("reads data-link and data-sync-origin on both the DOM and manifest paths", () => {
+    const doc = makeDoc(`
+      <div data-composition-id="root">
+        <video id="talk" class="clip" src="t.mp4" muted data-link="lk-1" data-sync-origin="lk-1" data-start="0" data-duration="5"></video>
+      </div>
+    `);
+    const fromDom = parseTimelineFromDOM(doc, 10).find((el) => el.domId === "talk");
+    expect(fromDom?.link).toBe("lk-1");
+    expect(fromDom?.syncOrigin).toBe("lk-1");
+    const element = createTimelineElementFromManifestClip({
+      clip: {
+        id: "talk",
+        label: "Talk",
+        kind: "element",
+        tagName: "video",
+        start: 0,
+        duration: 5,
+        track: 0,
+        compositionId: null,
+        parentCompositionId: null,
+        compositionSrc: null,
+        assetUrl: null,
+      },
+      fallbackIndex: 0,
+      doc,
+      hostEl: doc.getElementById("talk"),
+    });
+    expect(element.link).toBe("lk-1");
+    expect(element.syncOrigin).toBe("lk-1");
+  });
 });
 
 describe("group info cache", () => {
@@ -598,6 +629,61 @@ describe("audio FX attributes on parsed elements", () => {
     const [bgm] = parseTimelineFromDOM(doc, 10).filter((e) => e.domId === "bgm");
     expect(bgm?.fxChain).toBeUndefined();
     expect(bgm?.automation).toBeUndefined();
+  });
+});
+
+describe("the master chain on parsed elements", () => {
+  const CHAIN = '{"version":1,"nodes":[{"type":"truepeak","id":"m1","params":{}}]}';
+  const parseVideo = (rootAttrs: string, inner = ""): TimelineElement | undefined => {
+    const doc = new DOMParser().parseFromString(
+      `<div data-composition-id="main" data-start="0" data-duration="10" ${rootAttrs}>
+         <video id="talk" data-start="0" data-duration="10" data-has-audio="true"></video>${inner}
+       </div>`,
+      "text/html",
+    );
+    return parseTimelineFromDOM(doc, 10).find((e) => e.domId === "talk");
+  };
+
+  it("copies the root's data-fx-chain onto an element that has none of its own", () => {
+    const talk = parseVideo(`data-fx-chain='${CHAIN}'`);
+    expect(talk?.masterChain).toBe(CHAIN);
+    expect(talk?.fxChain).toBeUndefined();
+  });
+
+  it("leaves it unset when the root carries none", () => {
+    expect(parseVideo("")?.masterChain).toBeUndefined();
+  });
+
+  it("ignores a sub-composition root's chain", () => {
+    const inner = `<div data-composition-id="inner" data-fx-chain='${CHAIN}'></div>`;
+    expect(parseVideo("", inner)?.masterChain).toBeUndefined();
+  });
+
+  it("carries it on the manifest path too", () => {
+    const doc = makeDoc(`
+      <div data-composition-id="main" data-fx-chain='${CHAIN}'>
+        <video id="talk" data-has-audio="true"></video>
+      </div>
+    `);
+    const element = createTimelineElementFromManifestClip({
+      clip: {
+        id: "talk",
+        label: "Talk",
+        kind: "video",
+        tagName: "video",
+        start: 0,
+        duration: 10,
+        track: 0,
+        compositionId: null,
+        parentCompositionId: "main",
+        compositionSrc: null,
+        assetUrl: null,
+      },
+      fallbackIndex: 0,
+      doc,
+      hostEl: doc.getElementById("talk"),
+    });
+    expect(element.masterChain).toBe(CHAIN);
   });
 });
 

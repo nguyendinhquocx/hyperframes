@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -65,10 +65,15 @@ jobs:
     name: Detect changes
     runs-on: ubuntu-latest
     timeout-minutes: 2
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
     outputs:
       code: ${{ (github.event_name == 'workflow_dispatch' && inputs.catalog_publish) && 'true' || steps.filter.outputs.code }}
       docs_catalog: ${{ steps.filter.outputs.docs_catalog }}
       cli: ${{ steps.filter.outputs.cli }}
+      cli_bundle: ${{ steps.filter.outputs.cli_bundle }}
       skills: ${{ steps.filter.outputs.skills }}
       catalog_index: ${{ steps.filter.outputs.catalog_index }}
       codex_plugin: ${{ steps.filter.outputs.codex_plugin }}
@@ -79,16 +84,35 @@ jobs:
       # Force git-based change detection instead of the pull_request REST API.
       # The API path can fail the whole workflow on transient listFiles
       # timeouts before any real CI work starts.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+      - name: Check whether this commit already passed before a title or body edit
+        id: edit
+        uses: ./.github/actions/edit-already-passed
       - name: Reject accidental file deletions
         if: github.event_name == 'pull_request'
         run: node scripts/check-no-main-deletions.mjs --base origin/main
-      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4
+      # HEAD is the PR merge ref; its first parent is the current base tip, unlike the payload's
+      # base.sha, which goes stale and would count the base's newer commits as the PR's changes.
+      - name: Find the pull request's current base
+        id: base
+        if: github.event_name == 'pull_request'
+        run: |
+          git rev-parse --verify -q HEAD^2 > /dev/null || { echo "::error::HEAD is not the pull request merge commit"; exit 1; }
+          sha="$(git rev-parse --verify HEAD^1)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Reject large binaries outside LFS
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: sh scripts/check-large-files.sh --range "$BASE_SHA" HEAD
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         id: filter
+        if: steps.edit.outputs.passed != 'true'
         with:
           token: ""
+          base: ${{ steps.base.outputs.sha }}
           filters: |
             catalog_index:
               - "registry/**"
@@ -121,6 +145,12 @@ jobs:
               - "package.json"
               - "bun.lock"
               - ".github/workflows/ci.yml"
+            # Skills packages/cli/scripts/build-copy.mjs bundles into the CLI tarball (size budget).
+            cli_bundle:
+              - "skills/hyperframes/**"
+              - "skills/hyperframes-cli/**"
+              - "skills/gsap/**"
+              - "skills/media-use/**"
             skills:
               - "scripts/generate-captured-font-copies.mjs"
               - "packages/cli/src/media-use/**"
@@ -206,15 +236,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
-      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          # Docker Hub rate-limits anonymous pulls from shared runners; pull through Google's mirror.
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
       - name: Build BeginFrame contract image
         # A hung bun install (Dockerfile.test, run 35468046055) would
         # otherwise eat the whole job timeout instead of failing at this step.
         timeout-minutes: 10
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: packages/gcp-cloud-run/Dockerfile
@@ -227,16 +263,16 @@ jobs:
     name: Build
     needs: changes
     # A skipped required check passes, so a broken change detection must fail it instead.
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true' || needs.changes.outputs.cli_bundle == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Require change detection
         if: needs.changes.result != 'success'
         run: |
-          echo "::error::Change detection did not succeed, so this required check cannot pass."
+          echo "::error::Detect changes did not succeed (it also rejects large binaries outside LFS); see its log. This required check cannot pass."
           exit 1
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -265,7 +301,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
           fetch-depth: 0
@@ -288,7 +324,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -341,7 +377,7 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # Full history so `--base origin/main` can diff against the merge
           # base on stacked PRs, not just the shallow tip.
@@ -352,6 +388,11 @@ jobs:
           node-version: 22
       - uses: ./.github/actions/prepare-ffmpeg-bin
       - run: bash scripts/ci/install-workspace-dependencies.sh
+      - name: Build generated inspector inputs
+        run: |
+          bun run --filter '@hyperframes/{parsers,lint}' build
+          bun run build:hyperframes-runtime
+          bun run --filter @hyperframes/inspector build
       - name: Run fallow audit
         id: audit
         # `bun install` above made `bunx fallow` resolve from node_modules, so
@@ -399,7 +440,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -421,9 +462,9 @@ jobs:
       - name: Require change detection
         if: needs.changes.result != 'success'
         run: |
-          echo "::error::Change detection did not succeed, so this required check cannot pass."
+          echo "::error::Detect changes did not succeed (it also rejects large binaries outside LFS); see its log. This required check cannot pass."
           exit 1
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -441,9 +482,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
           fetch-depth: 0
@@ -467,7 +508,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -489,7 +530,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
           fetch-depth: 0
@@ -513,7 +554,7 @@ jobs:
       - run: bun run test:scripts
         env:
           HYPERFRAMES_BROWSER_PATH: ${{ steps.catalog-chrome.outputs.chrome-path }}
-      - run: bun run --filter '@hyperframes/{lint,parsers,studio-server,sdk,player,aws-lambda,gcp-cloud-run,sdk-playground,shader-transitions}' test
+      - run: bun run --filter '@hyperframes/{lint,parsers,studio-server,sdk,player,aws-lambda,gcp-cloud-run,sdk-playground,shader-transitions,inspector}' test
 
   test:
     name: Test
@@ -527,7 +568,7 @@ jobs:
       - name: Require change detection
         if: needs.changes.result != 'success'
         run: |
-          echo "::error::Change detection did not succeed, so this required check cannot pass."
+          echo "::error::Detect changes did not succeed (it also rejects large binaries outside LFS); see its log. This required check cannot pass."
           exit 1
       - name: Require producer source tests
         if: needs.changes.outputs.code == 'true' && needs.producer-source-tests.result != 'success'
@@ -557,7 +598,7 @@ jobs:
       matrix:
         lane: [unit, integration]
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -589,7 +630,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
@@ -622,7 +663,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
@@ -645,7 +686,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -661,7 +702,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - name: Verify skills-manifest.json matches skills/
         run: bun packages/cli/scripts/gen-skills-manifest.ts --check
@@ -678,7 +719,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - name: Lint SKILL.md files across skills/, .claude/skills/, .agents/skills/
         run: bun scripts/lint-skills.ts
@@ -692,7 +733,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
@@ -716,7 +757,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -736,7 +777,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - run: bash scripts/ci/install-workspace-dependencies.sh
       # Build workspace deps so the sdk's @hyperframes/parsers + core subpath
@@ -756,9 +797,9 @@ jobs:
       - name: Require change detection
         if: needs.changes.result != 'success'
         run: |
-          echo "::error::Change detection did not succeed, so this required check cannot pass."
+          echo "::error::Detect changes did not succeed (it also rejects large binaries outside LFS); see its log. This required check cannot pass."
           exit 1
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -779,7 +820,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -825,7 +866,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 18
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -846,28 +887,45 @@ jobs:
             packages/studio/data/projects/timeline-virtualization
           cp -R packages/studio/tests/e2e/fixtures/studio-open \
             packages/studio/data/projects/studio-open
+          cp -R packages/studio/tests/e2e/fixtures/fade-handles \
+            packages/studio/data/projects/fade-handles
+          cp -R packages/studio/tests/e2e/fixtures/timeline-trim-snap \
+            packages/studio/data/projects/timeline-trim-snap
+          cp -R packages/studio/tests/e2e/fixtures/inline-text-caret \
+            packages/studio/data/projects/inline-text-caret
+          cp -R packages/studio/tests/e2e/fixtures/undo-socket-pool \
+            packages/studio/data/projects/undo-socket-pool
+          cp -R packages/studio/tests/e2e/fixtures/aroll-backdrop \
+            packages/studio/data/projects/aroll-backdrop
+      - name: Build the base the viewport gate compares against
+        # The first parent of the checked-out commit, as in base-file.sh. Measured only when the head misses a budget.
+        run: |
+          set -euo pipefail
+          base="$(git cat-file -p HEAD | awk '/^parent /{print $2; exit}')"
+          git fetch --no-tags --depth=1 origin "$base"
+          GIT_LFS_SKIP_SMUDGE=1 git worktree add --detach /tmp/studio-base "$base"
+          cd /tmp/studio-base
+          bash scripts/ci/install-workspace-dependencies.sh
+          bun run --filter '@hyperframes/{parsers,lint,studio-server}' build
+          bun run --cwd packages/core build
+          bun run --cwd packages/core build:hyperframes-runtime
+          # The same projects as the head's server, so neither side serves more than the other.
+          cp -R "$GITHUB_WORKSPACE/packages/studio/data" packages/studio/data
       - name: Read the base branch's work-count ceilings
         # A ceiling may not disappear, or rise without a new reason, against the branch this PR merges into.
         if: github.event_name == 'pull_request'
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          git fetch --no-tags --depth=1 origin "$BASE_REF"
-          if ! git show FETCH_HEAD:packages/studio/tests/e2e/perf-ceilings.json > /tmp/base-perf-ceilings.json; then
-            rm -f /tmp/base-perf-ceilings.json
-            echo "The base branch has no perf-ceilings.json yet"
-          fi
+        run: bash scripts/ci/base-file.sh packages/studio/tests/e2e/perf-ceilings.json /tmp/base-perf-ceilings.json
       - name: Run both arms of the timeline viewport gate
         run: |
           set -euo pipefail
 
-          SERVER_PID=""
-          stop_server() {
-            if [[ -n "$SERVER_PID" ]]; then
-              kill "$SERVER_PID" 2>/dev/null || true
-              wait "$SERVER_PID" 2>/dev/null || true
-              SERVER_PID=""
-            fi
+          SERVER_PIDS=()
+          stop_servers() {
+            for pid in "${SERVER_PIDS[@]}"; do
+              kill "$pid" 2>/dev/null || true
+              wait "$pid" 2>/dev/null || true
+            done
+            SERVER_PIDS=()
           }
           wait_for_server() {
             local port="$1"
@@ -878,51 +936,55 @@ jobs:
             echo "FAIL: studio dev server did not start on port ${port}"
             return 1
           }
-          trap stop_server EXIT
+          trap stop_servers EXIT
 
-          # Run one server at a time so the measured browser never competes with
-          # a second Vite module graph on the shared runner. The development
-          # server supplies the fixture API; production React matches shipped
-          # rendering behavior, and the gate asserts that runtime before timing.
-          NODE_ENV=production \
-            bun run --cwd packages/studio dev -- --port 5313 --strictPort &
-          SERVER_PID=$!
+          # One arm at a time, so no other arm's Vite module graph competes with the measured browser.
+          # The base page loads only if the head misses a budget; production React matches shipped
+          # rendering, and the gate asserts that runtime before timing.
+          run_arm() {
+            local arm="$1" port="$2" virtualization="$3" count="$4" enabled="$5"
+            NODE_ENV=production VITE_STUDIO_TIMELINE_ROW_VIRTUALIZATION_ENABLED="$enabled" \
+              bun run --cwd /tmp/studio-base/packages/studio dev -- --port "$((port + 10))" --strictPort &
+            SERVER_PIDS+=($!)
+            NODE_ENV=production VITE_STUDIO_TIMELINE_ROW_VIRTUALIZATION_ENABLED="$enabled" \
+              bun run --cwd packages/studio dev -- --port "$port" --strictPort &
+            SERVER_PIDS+=($!)
+            local status=0
+            if wait_for_server "$((port + 10))" && wait_for_server "$port"; then
+              STUDIO_URL="http://localhost:${port}/#project/timeline-virtualization" \
+                BASE_STUDIO_URL="http://localhost:$((port + 10))/#project/timeline-virtualization" \
+                TIMELINE_ROW_VIRTUALIZATION="$virtualization" \
+                TIMELINE_ELEMENT_COUNT="$count" \
+                TIMELINE_TIER=ci \
+                node packages/studio/tests/e2e/timeline-virtualization.mjs \
+                | tee "/tmp/timeline-gate-${arm}.json" \
+                || status=$?
+            else
+              status=1
+            fi
+            stop_servers
+            return "$status"
+          }
           DEFAULT_STATUS=0
-          if wait_for_server 5313; then
-            STUDIO_URL="http://localhost:5313/#project/timeline-virtualization" \
-              TIMELINE_ROW_VIRTUALIZATION=on \
-              TIMELINE_ELEMENT_COUNT=50000 \
-              TIMELINE_TIER=ci \
-              node packages/studio/tests/e2e/timeline-virtualization.mjs \
-              | tee /tmp/timeline-gate-default.json \
-              || DEFAULT_STATUS=$?
-          else
-            DEFAULT_STATUS=1
-          fi
-          stop_server
-
-          NODE_ENV=production \
-            VITE_STUDIO_TIMELINE_ROW_VIRTUALIZATION_ENABLED=0 \
-            bun run --cwd packages/studio dev -- --port 5314 --strictPort &
-          SERVER_PID=$!
+          run_arm default 5313 on 50000 1 || DEFAULT_STATUS=$?
           DISABLED_STATUS=0
-          if wait_for_server 5314; then
-            STUDIO_URL="http://localhost:5314/#project/timeline-virtualization" \
-              TIMELINE_ROW_VIRTUALIZATION=off \
-              TIMELINE_ELEMENT_COUNT=1000 \
-              TIMELINE_TIER=ci \
-              node packages/studio/tests/e2e/timeline-virtualization.mjs \
-              | tee /tmp/timeline-gate-disabled.json \
-              || DISABLED_STATUS=$?
-          else
-            DISABLED_STATUS=1
-          fi
-          stop_server
+          run_arm disabled 5314 off 1000 0 || DISABLED_STATUS=$?
 
           {
             echo "### Timeline viewport gate"
             echo "- Default arm exit: ${DEFAULT_STATUS}"
             echo "- Explicitly disabled arm exit: ${DISABLED_STATUS}"
+            for arm in default disabled; do
+              node -e '
+                const e = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+                const b = e.environment.appliedBudgets;
+                for (const a of e.attempts)
+                  console.log(`- ${process.argv[2]} attempt ${a.attempt}: interaction p95 ${a.interactionP95Ms.toFixed(1)}/${b.interactionP95Ms} ms, frame p95 ${a.frameIntervalP95Ms.toFixed(1)}/${b.frameIntervalP95Ms} ms, ${a.passingRuns}/${a.runs.length} runs, ${a.passed ? "pass" : "fail"}`);
+                const c = e.againstBase;
+                if (c)
+                  console.log(`- ${process.argv[2]} against base on this runner: ${c.summary}`);
+              ' "/tmp/timeline-gate-${arm}.json" "$arm" || echo "- ${arm}: no evidence"
+            done
           } >> "$GITHUB_STEP_SUMMARY"
 
           if (( DEFAULT_STATUS != 0 || DISABLED_STATUS != 0 )); then
@@ -953,6 +1015,79 @@ jobs:
           node packages/studio/tests/e2e/perf-ratchet.mjs check \
             packages/studio/tests/e2e/perf-ceilings.json studio-open /tmp/studio-open-counts.json \
             /tmp/base-perf-ceilings.json
+      - name: Check fade handles, render selects, thumbnail connection release, trim snapping and a script-hidden backdrop
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          NODE_ENV=production bun run --cwd packages/studio dev -- --port 5316 --strictPort &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do
+            if curl -sf "http://localhost:5316/" >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          if ! curl -sf "http://localhost:5316/" >/dev/null 2>&1; then
+            echo "FAIL: studio dev server did not start on port 5316"
+            exit 1
+          fi
+          # All checks run even when an earlier one fails.
+          rc=0
+          STUDIO_URL="http://localhost:5316/#project/fade-handles" \
+            node packages/studio/tests/e2e/fade-handles.mjs || rc=1
+          STUDIO_URL="http://localhost:5316/#project/fade-handles?tab=renders" \
+            node packages/studio/tests/e2e/render-selects.mjs || rc=1
+          STUDIO_URL="http://localhost:5316/" \
+            node packages/studio/tests/e2e/thumbnail-save.mjs || rc=1
+          STUDIO_URL="http://localhost:5316/#project/timeline-trim-snap" \
+            node packages/studio/tests/e2e/timeline-trim-snap.mjs || rc=1
+          rm -rf packages/studio/data/projects/timeline-trim-snap
+          cp -R packages/studio/tests/e2e/fixtures/timeline-trim-snap \
+            packages/studio/data/projects/timeline-trim-snap
+          STUDIO_URL="http://localhost:5316/#project/timeline-trim-snap" \
+            node packages/studio/tests/e2e/timeline-snap-release.mjs || rc=1
+          STUDIO_URL="http://localhost:5316/#project/aroll-backdrop" \
+            node packages/studio/tests/e2e/aroll-backdrop.mjs || rc=1
+          exit "$rc"
+      - name: Measure the caret of a text edited in place
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          NODE_ENV=production bun run --cwd packages/studio dev -- --port 5317 --strictPort &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do
+            if curl -sf "http://localhost:5317/" >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          if ! curl -sf "http://localhost:5317/" >/dev/null 2>&1; then
+            echo "FAIL: studio dev server did not start on port 5317"
+            exit 1
+          fi
+          STUDIO_URL="http://localhost:5317/#project/inline-text-caret" \
+            EVIDENCE_DIR=/tmp/inline-text-caret \
+            node packages/studio/tests/e2e/inline-text-caret.mjs
+      - name: Install ffmpeg for the paused-video fixture
+        if: success() || failure()
+        uses: ./.github/actions/install-ffmpeg-linux
+      - name: Undo while paused videos hold the preview's sockets
+        # Counts the undo's wait for a socket, not its total time: unpinned it is 0 ms.
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          NODE_ENV=production bun run --cwd packages/studio dev -- --port 5318 --strictPort &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do
+            if curl -sf "http://localhost:5318/" >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          if ! curl -sf "http://localhost:5318/" >/dev/null 2>&1; then
+            echo "FAIL: studio dev server did not start on port 5318"
+            exit 1
+          fi
+          STUDIO_URL="http://localhost:5318/#project/undo-socket-pool" \
+            STUDIO_PROJECT_DIR="$PWD/packages/studio/data/projects/undo-socket-pool" \
+            node packages/studio/tests/e2e/undo-socket-pool.mjs | tee /tmp/undo-socket-pool.json
       - name: Upload gate evidence
         # The gate's whole output is machine-readable evidence, and a red run is
         # exactly when someone needs to read it. Keep it on failure too.
@@ -963,11 +1098,13 @@ jobs:
           path: |
             /tmp/timeline-gate-*.json
             /tmp/studio-open-counts.json
+            /tmp/inline-text-caret/*.png
+            /tmp/undo-socket-pool.json
           if-no-files-found: error
 
   # Manual editing accuracy in the built Studio, gated against the base branch's baseline.json.
   studio-edit-accuracy:
-    name: "Studio: edit accuracy (${{ matrix.shard }}/8)"
+    name: "Studio: edit accuracy (${{ matrix.shard }}/20)"
     needs: [changes, build]
     if: github.event_name == 'pull_request' && needs.changes.outputs.edit_accuracy == 'true'
     runs-on: ubuntu-latest
@@ -975,9 +1112,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -993,19 +1130,14 @@ jobs:
       # Studio and the producer both run in the engine's pinned headless shell.
       - run: node packages/cli/dist/cli.js browser ensure
       - name: Read the base branch's edit accuracy baseline
-        env:
-          BASE_REF: ${{ github.base_ref }}
         run: |
-          git fetch --no-tags --depth=1 origin "$BASE_REF"
-          if ! git show FETCH_HEAD:packages/studio/tests/e2e/edit-accuracy/baseline.json > /tmp/base-edit-accuracy.json; then
-            echo '{"cases":{}}' > /tmp/base-edit-accuracy.json
-            echo "The base branch has no edit accuracy baseline yet"
-          fi
+          bash scripts/ci/base-file.sh packages/studio/tests/e2e/edit-accuracy/baseline.json /tmp/base-edit-accuracy.json
+          [ -f /tmp/base-edit-accuracy.json ] || echo '{"cases":{}}' > /tmp/base-edit-accuracy.json
       - name: Run this shard, then re-run twice each case whose verdict differs from the base branch
         run: |
           set -euo pipefail
           bench() { bun run --cwd packages/studio test:edit-accuracy -- --grid full --jobs 2 "$@"; }
-          bench --shard "${{ matrix.shard }}/8" --out /tmp/edit-accuracy/run1
+          bench --shard "${{ matrix.shard }}/20" --out /tmp/edit-accuracy/run1
           mapfile -t FLIPPED < <(node packages/studio/tests/e2e/edit-accuracy/ratchet.mjs flipped \
             /tmp/base-edit-accuracy.json /tmp/edit-accuracy/run1/results.json)
           if (( ${#FLIPPED[@]} > 0 )); then
@@ -1030,19 +1162,14 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - name: Read the base branch's edit accuracy baseline
-        env:
-          BASE_REF: ${{ github.base_ref }}
         run: |
-          git fetch --no-tags --depth=1 origin "$BASE_REF"
-          if ! git show FETCH_HEAD:packages/studio/tests/e2e/edit-accuracy/baseline.json > /tmp/base-edit-accuracy.json; then
-            echo '{"cases":{}}' > /tmp/base-edit-accuracy.json
-            echo "The base branch has no edit accuracy baseline yet"
-          fi
+          bash scripts/ci/base-file.sh packages/studio/tests/e2e/edit-accuracy/baseline.json /tmp/base-edit-accuracy.json
+          [ -f /tmp/base-edit-accuracy.json ] || echo '{"cases":{}}' > /tmp/base-edit-accuracy.json
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: edit-accuracy-shard-*
@@ -1083,7 +1210,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -1155,7 +1282,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -1280,7 +1407,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - name: Check file sizes (max 600 lines)
@@ -1342,7 +1469,7 @@ jobs:
         with:
           types: ${{ env.PR_TITLE_TYPES }}
       - if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - if: github.event_name == 'workflow_dispatch'
@@ -1351,7 +1478,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
       - if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: amannn/action-semantic-pull-request
           ref: e32d7e603df1aa1ba07e981f2a23455dee596825 # v5

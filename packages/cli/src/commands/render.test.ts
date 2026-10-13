@@ -1,6 +1,6 @@
 // fallow-ignore-file code-duplication
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -1207,6 +1207,32 @@ describe("renderLocal browser GPU config", () => {
     vi.advanceTimersByTime(100);
     expect(consumeCommandResult().exitCode).toBe(0);
   });
+
+  it("still completes the render when the output registry cannot be written", async () => {
+    const project = mkdtempSync(join(tmpdir(), "hf-render-unrecorded-"));
+    mkdirSync(join(project, ".hyperframes"));
+    writeFileSync(join(project, ".hyperframes", "render-outputs.json"), "{");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await renderLocal(project, join(project, "out.mp4"), {
+        fps: { num: 30, den: 1 },
+        quality: "standard",
+        format: "mp4",
+        gpu: false,
+        browserGpuMode: "hardware",
+        hdrMode: "auto",
+        quiet: true,
+      });
+      expect(
+        warn.mock.calls.some((call) =>
+          String(call[0]).includes("Render output was not registered"),
+        ),
+      ).toBe(true);
+    } finally {
+      warn.mockRestore();
+      rmSync(project, { recursive: true, force: true });
+    }
+  });
 });
 
 // Suite renamed with the breaker work: this is no longer an opt-in trial. The
@@ -2045,6 +2071,16 @@ describe("normalizeStageCode", () => {
   it("keeps one code for the producer's browser start-up counts", () => {
     expect(normalizeStageCode("Starting browsers (0/6 ready)")).toBe("starting_browsers");
     expect(normalizeStageCode("Starting browsers (5/6 ready)")).toBe("starting_browsers");
+  });
+
+  it("keeps one code per stage whatever its live frame counts", () => {
+    expect(normalizeStageCode("Encoding frame 600/600")).toBe("encoding_video");
+    expect(normalizeStageCode("Encoding frame 12/90")).toBe("encoding_video");
+    expect(normalizeStageCode("Capturing frame 120/600 (6 workers)")).toBe("capturing_frame");
+    expect(normalizeStageCode("Streaming frame 3/40 (segment 1/2, 2 workers)")).toBe(
+      "streaming_frame",
+    );
+    expect(normalizeStageCode("Assembling final video")).toBe("assembling_final_video");
   });
 
   it("slugifies an unrecognized stage string instead of bucketing it as unknown", () => {

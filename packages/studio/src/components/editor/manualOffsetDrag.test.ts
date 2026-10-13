@@ -13,6 +13,7 @@ import {
   resolveManualOffsetForPointerDelta,
   type ManualOffsetDragMatrix,
 } from "./manualOffsetDrag";
+import { UNREADABLE_TRANSLATE } from "./plainTranslate";
 import { STUDIO_OFFSET_X_PROP, STUDIO_OFFSET_Y_PROP } from "./manualEdits";
 import { computeDraggedGsapPosition } from "../../hooks/draggedGsapPosition";
 
@@ -451,6 +452,29 @@ describe("GSAP-element drag — dot-a flies regressions", () => {
   });
 });
 
+describe("a drag that starts while an earlier gesture is still saving", () => {
+  it("keeps the timelines paused until the later drag ends", () => {
+    const { element, member } = makeGsapDot();
+    let paused = false;
+    const timeline = {
+      pause: () => (paused = true),
+      paused: (v?: boolean) => (paused = v ?? paused),
+    };
+    (element.ownerDocument.defaultView as unknown as { __timelines: unknown }).__timelines = {
+      main: timeline,
+    };
+    const earlier = member();
+    applyManualOffsetDragCommit(earlier, -50, 0);
+    const later = member();
+
+    endManualOffsetDragMembers([earlier]);
+
+    expect(paused).toBe(true);
+    endManualOffsetDragMembers([later]);
+    expect(paused).toBe(false);
+  });
+});
+
 describe("sub-pixel drags", () => {
   it("draft and commit both land the exact fractional position", () => {
     const { element, sets, member } = makeGsapDot();
@@ -596,6 +620,21 @@ describe("a move of an element GSAP does not position", () => {
     return { window, element, gsapCalls, member };
   }
 
+  it("refuses a translate it can't read instead of guessing, and leaves the element alone", () => {
+    const { element } = plainBox();
+    element.style.setProperty("translate", "abs(10% - 50px) 0px");
+    const result = createManualOffsetDragMember({
+      key: "box",
+      selection: { element } as never,
+      element,
+      rect: { left: 10, top: 20, width: 100, height: 50, editScaleX: 1, editScaleY: 1 },
+      gesture: "drag",
+    });
+    expect(result.ok).toBe(false);
+    expect(result.ok ? "" : result.reason).toBe(UNREADABLE_TRANSLATE);
+    expect(element.style.getPropertyValue("translate")).toBe("abs(10% - 50px) 0px");
+  });
+
   it("drafts and drops the element's own translate in plain px, never touching GSAP", () => {
     const { element, gsapCalls, member } = plainBox({ gsapLoaded: true });
     const m = member();
@@ -635,4 +674,45 @@ describe("a move of an element GSAP does not position", () => {
     Object.assign(window, { __timelines: { main: { getChildren: () => [hold] } } });
     expect(member().plainTranslate).toBe(false);
   });
+});
+
+describe("a resize's anchor member", () => {
+  function anchorMember(tweenVars?: Record<string, number>) {
+    const window = new Window();
+    const element = window.document.createElement("div");
+    element.id = "box";
+    window.document.body.append(element);
+    const tweens = tweenVars ? [{ vars: tweenVars, targets: () => [element] }] : [];
+    Object.assign(window, { __timelines: { main: { getChildren: () => tweens } } });
+    element.getBoundingClientRect = () => {
+      const [x = 0, y = 0] = element.style
+        .getPropertyValue("translate")
+        .split(" ")
+        .map((v) => Number.parseFloat(v));
+      return new window.DOMRect(10 + (x || 0), 20 + (y || 0), 100, 50);
+    };
+    const result = createManualOffsetDragMember({
+      key: "box",
+      selection: { element } as never,
+      element,
+      rect: { left: 10, top: 20, width: 100, height: 50, editScaleX: 1, editScaleY: 1 },
+      gesture: "resize",
+    });
+    if (!result.ok) throw new Error("member");
+    return result.member;
+  }
+
+  it("keeps the centre with the element's own plain translate when GSAP does not own the box", () => {
+    const member = anchorMember();
+    expect(member.plainTranslate).toBe(true);
+    applyManualOffsetDragDraft(member, -10.25, 3.5);
+    expect(member.element.style.getPropertyValue("translate")).toBe("-10.25px 3.5px");
+  });
+
+  it.each(["width", "maxWidth", "minHeight", "flexBasis", "scale", "scaleX"])(
+    "leaves a box whose %s GSAP tweens, which the CSS box writer also sets, to the GSAP writer",
+    (channel) => {
+      expect(anchorMember({ [channel]: 300 }).plainTranslate).toBe(false);
+    },
+  );
 });

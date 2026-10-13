@@ -58,7 +58,7 @@ export const BlockParamsPanel = memo(function BlockParamsPanel({
         if (matches === 0) {
           setCommitState({
             tone: "error",
-            message: `Couldn't find the current value in ${compositionPath} — it may have been edited by hand.`,
+            message: `Couldn't find the current value in ${compositionPath}. It may have been edited by hand.`,
           });
           trackBlockParamCommit({ tone: "error", blockName, key });
           return;
@@ -73,7 +73,7 @@ export const BlockParamsPanel = memo(function BlockParamsPanel({
         if (matches > 1) {
           setCommitState({
             tone: "error",
-            message: `"${previous}" appears ${matches}× in ${compositionPath} — the panel can't tell which one belongs to this parameter, so it won't risk changing unrelated content. Edit the file directly to disambiguate.`,
+            message: `"${previous}" appears ${matches}× in ${compositionPath}. The panel can't tell which one belongs to this parameter, so it won't risk changing unrelated content. Edit the file directly to disambiguate.`,
           });
           trackBlockParamCommit({ tone: "error", blockName, key });
           return;
@@ -170,8 +170,8 @@ export const BlockParamsPanel = memo(function BlockParamsPanel({
           <div className="text-[10px] text-neutral-500">This block has no editable parameters.</div>
         )}
         {!fileManager && params.length > 0 && (
-          <div className="text-[10px] text-amber-400/90">
-            Block params can't be edited here — no project file access.
+          <div className="text-[10px] text-warning-ink">
+            Block params can't be edited here: no project file access.
           </div>
         )}
         {params.map((param) => (
@@ -189,12 +189,12 @@ export const BlockParamsPanel = memo(function BlockParamsPanel({
           </div>
         )}
         {commitState.tone === "saved" && (
-          <div className="text-[10px] text-emerald-500/90" role="status">
+          <div className="text-[10px] text-accent-ink" role="status">
             Saved to {compositionPath}
           </div>
         )}
         {commitState.tone === "error" && (
-          <div className="text-[10px] text-red-400" role="alert">
+          <div className="text-[10px] text-danger-ink" role="alert">
             {commitState.message}
           </div>
         )}

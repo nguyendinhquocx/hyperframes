@@ -1,13 +1,19 @@
+import type { HistoryTarget } from "@hyperframes/studio-server";
 import { buildProjectApiPath } from "./projectRouting";
 import type { MutableRefObject } from "react";
 import { serializeStudioFileMutations } from "./studioFileMutationCoordinator";
 import { createStudioSaveHttpError } from "./studioSaveDiagnostics";
+import { studioApiFetch } from "./studioApiFetch";
+
+export type EditContextTarget = HistoryTarget;
 
 export interface RecordEditInput {
+  targets?: EditContextTarget[];
   label: string;
   coalesceKey?: string;
   coalesceMs?: number;
   files: Record<string, { before: string; after: string }>;
+  created?: string[];
 }
 
 export interface DomEditCommitBaseParams {
@@ -49,7 +55,9 @@ interface SaveProjectFilesWithHistoryInput {
 }
 
 export async function readProjectFileContent(pid: string, path: string): Promise<string> {
-  const response = await fetch(buildProjectApiPath(pid, `/files/${encodeURIComponent(path)}`));
+  const response = await studioApiFetch(
+    buildProjectApiPath(pid, `/files/${encodeURIComponent(path)}`),
+  );
   if (!response.ok) {
     throw await createStudioSaveHttpError(response, `Failed to read ${path}`);
   }
@@ -77,6 +85,7 @@ export async function saveServerRewriteWithHistory(input: {
   path: string;
   label: string;
   coalesceKey?: string;
+  coalesceMs?: number;
   writeFile: ProjectFileWriter;
   recordEdit: (entry: RecordEditInput) => Promise<void>;
   rewrite: (original: string) => Promise<{ disk: string; after?: string } | null>;

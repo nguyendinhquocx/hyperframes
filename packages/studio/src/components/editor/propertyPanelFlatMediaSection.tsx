@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { isVideoAudible } from "../../player/lib/timelineElementHelpers";
 import { useTrackDesignInput } from "../../contexts/DesignPanelInputContext";
 import { Check, ClipboardList } from "../../icons/SystemIcons";
 import type { DomEditSelection } from "./domEditing";
@@ -9,7 +10,6 @@ import {
   formatTimingValue,
   parseNumericValue,
   readClipInPoint,
-  stripQueryAndHash,
 } from "./propertyPanelHelpers";
 import { FlatSelectRow, FlatSlider } from "./propertyPanelFlatPrimitives";
 import { FlatToggle } from "./propertyPanelFlatToggle";
@@ -34,15 +34,20 @@ import {
   readFadeSeconds,
 } from "@hyperframes/core/audio-fade";
 import { parseGainInput, parseRateInput, parseSecondsInput } from "./audioInspectorInput";
+import type { CommitDomAttributeBatch } from "../../hooks/domEditCommitTypes";
+import { commitCutout, commitHasAudioToggle, commitMutedToggle } from "./mediaAudioEdits";
+import { authoredSrcPath } from "../../player/components/thumbnailUtils";
 
 // fallow-ignore-next-line complexity
 export function FlatMediaSection({
+  projectId = null,
   projectDir,
   element,
   styles,
   onSetStyle,
   onSetAttribute,
   onSetHtmlAttribute,
+  onSetAttributeBatch,
   onRemoveBackground,
   volumeAutomated,
   onAutomateVolume,
@@ -51,12 +56,14 @@ export function FlatMediaSection({
   automatedVolumeValue,
   rate,
 }: {
+  projectId?: string | null;
   projectDir: string | null;
   element: DomEditSelection;
   styles: Record<string, string>;
   onSetStyle: (prop: string, value: string) => void | Promise<unknown>;
   onSetAttribute: (attr: string, value: string) => void | Promise<void>;
   onSetHtmlAttribute: (attr: string, value: string | null) => void | Promise<void>;
+  onSetAttributeBatch: CommitDomAttributeBatch;
   /** A volume lane in the timeline drives the level; the slider writes a keyframe instead. */
   volumeAutomated?: boolean;
   onAutomateVolume?: () => void;
@@ -104,7 +111,11 @@ export function FlatMediaSection({
   const fadeMax = clipDuration > 0 ? clipDuration : 10;
   const hasLoop = el.hasAttribute("loop");
   const hasMuted = el.hasAttribute("muted");
-  const hasAudio = element.dataAttributes["has-audio"] === "true";
+  const hasAudio = isVideoAudible({
+    tag: el.tagName,
+    hasAudioAttr: element.dataAttributes["has-audio"],
+    muted: el.hasAttribute("muted"),
+  });
   const objectFit = styles["object-fit"] || "contain";
   const objectPosition = styles["object-position"] || "center";
 
@@ -115,12 +126,11 @@ export function FlatMediaSection({
   const [createPlate, setCreatePlate] = useState(false);
   const [quality, setQuality] = useState<"fast" | "balanced" | "best">("balanced");
 
-  const absoluteSrc =
-    projectDir && srcAttr && !srcAttr.startsWith("http") ? `${projectDir}/${srcAttr}` : srcAttr;
   const projectSrc =
     srcAttr && !/^(?:https?:|data:|blob:)/i.test(srcAttr)
-      ? stripQueryAndHash(srcAttr.startsWith("./") ? srcAttr.slice(2) : srcAttr)
+      ? authoredSrcPath(srcAttr.startsWith("./") ? srcAttr.slice(2) : srcAttr)
       : "";
+  const absoluteSrc = projectDir && projectSrc ? `${projectDir}/${projectSrc}` : srcAttr;
   const canRemoveBackground = Boolean(onRemoveBackground && isVisualMedia && projectSrc);
 
   useEffect(() => {
@@ -128,13 +138,7 @@ export function FlatMediaSection({
     setCreatePlate(false);
   }, [srcAttr]);
 
-  const applyCutoutResult = async (result: BackgroundRemovalResult) => {
-    await onSetHtmlAttribute("src", result.outputPath);
-    if (isVideo) {
-      await onSetAttribute("has-audio", "");
-      await onSetHtmlAttribute("muted", "true");
-    }
-  };
+  const mediaEdit = { element, projectId, projectSrc, commit: onSetAttributeBatch };
 
   const runBackgroundRemoval = async () => {
     if (!onRemoveBackground || !projectSrc || removeBusy) return;
@@ -147,8 +151,8 @@ export function FlatMediaSection({
         quality,
         onProgress: setRemoveProgress,
       });
-      await applyCutoutResult(result);
-      setRemoveProgress({ status: "complete", progress: 100, stage: "Applied cutout", ...result });
+      const stage = await commitCutout(mediaEdit, result.outputPath, hasAudio);
+      setRemoveProgress({ status: "complete", progress: 100, stage, ...result });
     } catch (error) {
       setRemoveProgress({
         status: "failed",
@@ -200,7 +204,7 @@ export function FlatMediaSection({
               data-flat-media-remove-bg="true"
               disabled={!canRemoveBackground || removeBusy}
               onClick={() => void runBackgroundRemoval()}
-              className="flex items-center gap-1 text-[10px] font-medium text-panel-accent disabled:cursor-not-allowed disabled:opacity-50"
+              className="flex items-center gap-1 text-[10px] font-medium text-accent-ink disabled:cursor-not-allowed disabled:opacity-50"
               title={
                 canRemoveBackground
                   ? "Remove background and save a transparent asset"
@@ -231,7 +235,7 @@ export function FlatMediaSection({
               <div className="h-1 overflow-hidden rounded-full bg-panel-hover">
                 <div
                   className={`h-full rounded-full ${
-                    removeProgress.status === "failed" ? "bg-red-400" : "bg-panel-accent"
+                    removeProgress.status === "failed" ? "bg-danger-ink" : "bg-panel-accent"
                   }`}
                   style={{ width: `${Math.max(0, Math.min(100, removeProgress.progress))}%` }}
                 />
@@ -362,21 +366,13 @@ export function FlatMediaSection({
           <FlatToggle
             label="Muted"
             checked={hasMuted}
-            onChange={(next) => void onSetHtmlAttribute("muted", next ? "true" : null)}
+            onChange={(next) => void commitMutedToggle(mediaEdit, next)}
           />
           {isVideo && (
             <FlatToggle
               label="Has audio track"
               checked={hasAudio}
-              onChange={(next) => {
-                if (next) {
-                  void onSetAttribute("has-audio", "true");
-                  void onSetHtmlAttribute("muted", null);
-                } else {
-                  void onSetAttribute("has-audio", "");
-                  void onSetHtmlAttribute("muted", "true");
-                }
-              }}
+              onChange={(next) => void commitHasAudioToggle(mediaEdit, next)}
             />
           )}
         </>

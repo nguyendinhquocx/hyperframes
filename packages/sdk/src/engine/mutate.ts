@@ -1,3 +1,4 @@
+import { replacementTimelineAssetId } from "@hyperframes/core/timeline-asset-id";
 /**
  * Op handlers for Phase 3a (non-parser ops).
  *
@@ -17,6 +18,8 @@ import type {
   JsonPatchOp,
 } from "../types.js";
 import type { ParsedDocument } from "./model.js";
+import { MEDIA_LINK_ATTR, linkScopeOf } from "@hyperframes/core/media-link";
+import { idsToUnlink, linkedPartnerIds } from "./linkedTiming.js";
 import {
   resolveScoped,
   escapeHfId,
@@ -136,7 +139,7 @@ function validateSetAttribute(name: string, value: string | null): void {
   }
   if (lower.startsWith("on")) {
     throw new Error(
-      `setAttribute: event-handler attributes ("${name}") are not permitted — ` +
+      `setAttribute: event-handler attributes ("${name}") are not permitted: ` +
         `they produce executable HTML that cannot be safely serialized.`,
     );
   }
@@ -276,6 +279,118 @@ function applyGsapOp(parsed: ParsedDocument, op: EditOp): MutationResult | undef
   }
 }
 
+const concatResults = (a: MutationResult, b: MutationResult): MutationResult => ({
+  forward: [...a.forward, ...b.forward],
+  inverse: [...a.inverse, ...b.inverse],
+});
+
+/**
+ * Timing edits apply to link partners too (start/duration; each keeps its own
+ * track). `linked: false` edits the targets alone and unlinks them.
+ */
+function applySetTiming(
+  parsed: ParsedDocument,
+  op: Extract<EditOp, { type: "setTiming" }>,
+): MutationResult {
+  const ids = targets(op.target);
+  const timing = { start: op.start, duration: op.duration, trackIndex: op.trackIndex };
+  if (op.linked === false) {
+    const unlink = idsToUnlink(parsed.document, ids);
+    const own = handleSetTiming(parsed, ids, timing);
+    return concatResults(own, handleSetAttribute(parsed, unlink, MEDIA_LINK_ATTR, null));
+  }
+  const plan = planLinkedTiming(parsed, ids, timing);
+  if (plan.refusal) throw new Error(plan.refusal);
+  let result = handleSetTiming(parsed, ids, timing);
+  for (const partner of plan.partners) {
+    result = concatResults(result, handleSetTiming(parsed, [partner.id], partner.timing));
+  }
+  return result;
+}
+
+type PartnerEdit = { id: HfId; timing: { start?: number; duration?: number } };
+
+function planLinkedTiming(
+  parsed: ParsedDocument,
+  ids: HfId[],
+  timing: { start?: number; duration?: number },
+): { partners: PartnerEdit[]; refusal: string | null } {
+  if (timing.start === undefined && timing.duration === undefined) {
+    return { partners: [], refusal: null };
+  }
+  const grabbedFor = grabbedBaselines(parsed, ids);
+  const partners: PartnerEdit[] = [];
+  for (const id of linkedPartnerIds(parsed.document, ids)) {
+    const el = resolveScoped(parsed.document, id);
+    const grabbed = el ? grabbedFor(el) : undefined;
+    if (!el || !grabbed) continue;
+    const partnerEdit = partnerTiming(grabbed, readClipTiming(el), timing);
+    if (partnerEdit.duration !== undefined && partnerEdit.duration <= 0) {
+      const tag = el.tagName.toLowerCase();
+      return {
+        partners: [],
+        refusal: `Linked ${tag} would start after the new end. Unlink or trim the ${tag} first.`,
+      };
+    }
+    partners.push({ id, timing: partnerEdit });
+  }
+  return { partners, refusal: null };
+}
+
+type ClipWindow = { start: number | null; duration: number | null };
+
+function grabbedBaselines(
+  parsed: ParsedDocument,
+  ids: HfId[],
+): (partner: Element) => ClipWindow | undefined {
+  const byScope = new Map<Element | null, Map<string, ClipWindow>>();
+  for (const id of ids) {
+    const el = resolveScoped(parsed.document, id);
+    const link = el?.getAttribute(MEDIA_LINK_ATTR);
+    if (!el || !link) continue;
+    const byLink = byScope.get(linkScopeOf(el)) ?? new Map<string, ClipWindow>();
+    byLink.set(link, readClipTiming(el));
+    byScope.set(linkScopeOf(el), byLink);
+  }
+  return (partner) => {
+    const link = partner.getAttribute(MEDIA_LINK_ATTR);
+    return link ? byScope.get(linkScopeOf(partner))?.get(link) : undefined;
+  };
+}
+const ALIGN_EPSILON_S = 1e-3;
+
+/**
+ * A partner follows the edit without resyncing: a start change shifts it by the
+ * same delta (keeping any offset); a duration change carries over only when the
+ * partner's end sat at the edited clip's end.
+ */
+function partnerTiming(
+  grabbed: ClipWindow,
+  partner: ClipWindow,
+  edit: { start?: number; duration?: number },
+): { start?: number; duration?: number } {
+  const timing: { start?: number; duration?: number } = {};
+  const [gStart, pStart] = [grabbed.start ?? 0, partner.start ?? 0];
+  if (edit.start !== undefined) timing.start = pStart + (edit.start - gStart);
+  const duration = partnerDuration(grabbed, partner, edit, timing.start ?? pStart);
+  if (duration !== undefined) timing.duration = duration;
+  return timing;
+}
+
+function partnerDuration(
+  grabbed: ClipWindow,
+  partner: ClipWindow,
+  edit: { start?: number; duration?: number },
+  partnerStart: number,
+): number | undefined {
+  if (edit.duration === undefined) return undefined;
+  const grabbedStart = grabbed.start ?? 0;
+  const grabbedEnd = grabbedStart + (grabbed.duration ?? 0);
+  const partnerEnd = (partner.start ?? 0) + (partner.duration ?? 0);
+  if (Math.abs(partnerEnd - grabbedEnd) >= ALIGN_EPSILON_S) return undefined;
+  return (edit.start ?? grabbedStart) + edit.duration - partnerStart;
+}
+
 export function applyOp(parsed: ParsedDocument, op: EditOp): MutationResult {
   const gsap = applyGsapOp(parsed, op);
   if (gsap !== undefined) return gsap;
@@ -287,11 +402,7 @@ export function applyOp(parsed: ParsedDocument, op: EditOp): MutationResult {
     case "setAttribute":
       return handleSetAttribute(parsed, targets(op.target), op.name, op.value);
     case "setTiming":
-      return handleSetTiming(parsed, targets(op.target), {
-        start: op.start,
-        duration: op.duration,
-        trackIndex: op.trackIndex,
-      });
+      return applySetTiming(parsed, op);
     case "setHold":
       return handleSetHold(parsed, targets(op.target), op.hold);
     case "moveElement":
@@ -435,6 +546,14 @@ function handleSetAttribute(
     const oldValue = el.getAttribute(name);
     const path = attrPath(id, name);
     if (value !== null) {
+      const replacementId =
+        name === "src" ? replacementTimelineAssetId(parsed.document, el, value) : null;
+      if (replacementId !== null) {
+        const idPatch = scalarChange(attrPath(id, "id"), el.getAttribute("id"), replacementId);
+        el.setAttribute("id", replacementId);
+        result.forward.push(idPatch.forward);
+        result.inverse.push(idPatch.inverse);
+      }
       el.setAttribute(name, value);
       const p = scalarChange(path, oldValue, value);
       result.forward.push(p.forward);
@@ -938,7 +1057,7 @@ function fragmentCompositionErr(parsed: ParsedDocument): CanResult | null {
   return canErr(
     "E_FRAGMENT_COMPOSITION",
     "Fragment compositions cannot carry variable declarations.",
-    "The composition has no root element to hold data-composition-variables — add a composition root or convert to a full HTML document.",
+    "The composition has no root element to hold data-composition-variables. Add a composition root or convert to a full HTML document.",
   );
 }
 
@@ -964,7 +1083,7 @@ function invalidVariableIdErr(id: string): CanResult {
   return canErr(
     "E_INVALID_VARIABLE_ID",
     `Variable id ${JSON.stringify(id)} is not a valid identifier.`,
-    "Ids must match /^[A-Za-z_][A-Za-z0-9_-]*$/ — they become CSS custom-property names (--id), data-var-* attribute values, and CLI --variables keys.",
+    "Ids must match /^[A-Za-z_][A-Za-z0-9_-]*$/ because they become CSS custom-property names (--id), data-var-* attribute values, and CLI --variables keys.",
   );
 }
 
@@ -1592,7 +1711,7 @@ function gsapAnimationMissing(parsed: ParsedDocument, animationId: string): CanR
     : canErr(
         "E_TARGET_NOT_FOUND",
         `No GSAP animation found with id "${animationId}".`,
-        "Animation ids are positional and shift after edits — re-read them from comp before dispatching.",
+        "Animation ids are positional and shift after edits. Re-read them from comp before dispatching.",
       );
 }
 
@@ -1637,7 +1756,11 @@ export function validateOp(parsed: ParsedDocument, op: EditOp): CanResult {
           `Element(s) not found: ${missing.join(", ")}.`,
           "Verify the id against comp.getElements() or comp.find().",
         );
-      return CAN_OK;
+      const refusal =
+        op.type === "setTiming" && op.linked !== false
+          ? planLinkedTiming(parsed, ids, op).refusal
+          : null;
+      return refusal ? canErr("E_LINKED_PARTNER_CROSSED", refusal) : CAN_OK;
     }
     case "addElement": {
       if (op.parent !== null && resolveScoped(parsed.document, op.parent) === null)
@@ -1705,7 +1828,7 @@ export function validateOp(parsed: ParsedDocument, op: EditOp): CanResult {
         return canErr(
           "E_INVALID_ARGS",
           `declaration.id ("${op.declaration.id}") must match id ("${op.id}").`,
-          "Variable ids are immutable — rename via removeVariableDeclaration + declareVariable.",
+          "Variable ids are immutable. Rename via removeVariableDeclaration + declareVariable.",
         );
       if (
         findVariableDeclaration(

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type MutableRefObject } from "react";
 import {
+  mergeFileChangePayloads,
   readFileChangeAffectedCompositions,
   readFileChangeAffectsPreview,
   readFileChangeField,
@@ -124,14 +125,18 @@ function decodeFileChange(delivery: unknown): unknown {
   }
 }
 
-/**
- * The production transport. vitest defines `import.meta.hot`, so the selection
- * below never reaches this rung under test; the rung itself is exported so a test
- * can drive a real `MessageEvent` through the listener it registers.
- */
-export function sseFileChangeChannel(onDelivery: (delivery: unknown) => void): () => void {
+export function sseFileChangeChannel(
+  onDelivery: (delivery: unknown) => void,
+  onReconnect: () => void,
+): () => void {
   const eventSource = new EventSource("/api/events");
   eventSource.addEventListener("file-change", onDelivery);
+  // Reopening the stream does not replay changes missed during a disconnect.
+  let opened = false;
+  eventSource.addEventListener("open", () => {
+    if (opened) onReconnect();
+    opened = true;
+  });
   return () => eventSource.close();
 }
 
@@ -163,15 +168,24 @@ export function useExternalFileChangeCoordinator({
   onAcceptedPersistedFileChange,
   refreshFileTree,
 }: ExternalFileChangeCoordinatorOptions): ExternalFileChangeCoordinatorHandle {
-  const [blocked, setBlocked] = useState<ExternalFileChangeBlockedState | null>(null);
+  const [blocked, setBlockedState] = useState<ExternalFileChangeBlockedState | null>(null);
   const generationRef = useRef(0);
   const mountedRef = useRef(true);
   const lastEventIdentityRef = useRef<string | null>(null);
-  const blockedRef = useRef(blocked);
+  const blockedRef = useRef<ExternalFileChangeBlockedState | null>(null);
   const snapshotWriteTailRef = useRef<Promise<void>>(Promise.resolve());
   const drainingRef = useRef(false);
   const pendingPayloadRef = useRef<{ payload: unknown } | null>(null);
-  blockedRef.current = blocked;
+  // A newer blocked change replaces the held one, so it inherits what the held one owed.
+  const setBlocked = useCallback((next: ExternalFileChangeBlockedState | null) => {
+    const held = blockedRef.current;
+    const current =
+      next && held
+        ? { ...next, payload: mergeFileChangePayloads(held.payload, next.payload) }
+        : next;
+    blockedRef.current = current;
+    setBlockedState(current);
+  }, []);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -182,10 +196,14 @@ export function useExternalFileChangeCoordinator({
   }, []);
 
   useEffect(() => {
+    pendingPayloadRef.current = null;
+  }, [projectId]);
+
+  useEffect(() => {
     generationRef.current += 1;
     setBlocked(null);
     lastEventIdentityRef.current = null;
-  }, [projectId, activeCompPath]);
+  }, [projectId, activeCompPath, setBlocked]);
 
   useEffect(() => {
     if (!projectId || !recoveryFilePath || !loadConflictSnapshot) return;
@@ -229,10 +247,14 @@ export function useExternalFileChangeCoordinator({
     return () => {
       cancelled = true;
     };
-  }, [loadConflictSnapshot, projectId, recoveryFilePath]);
+  }, [loadConflictSnapshot, projectId, recoveryFilePath, setBlocked]);
 
-  const reloadAcceptedGeneration = useCallback(
-    (path: string, affectsPreview = true) => {
+  // What a settled change owes: thumbnails (unless its own write's echo brings them), then reloads.
+  const deliverOwed = useCallback(
+    (owed: unknown, accept = true) => {
+      const path = readStudioFileChangePath(owed) ?? ".";
+      const affectsPreview = readFileChangeAffectsPreview(owed);
+      if (accept) onAcceptedPersistedFileChange(path, readFileChangeAffectedCompositions(owed));
       logReload(affectsPreview ? "reload" : "file-tree only", {
         path,
         by: "external-change coordinator",
@@ -246,7 +268,7 @@ export function useExternalFileChangeCoordinator({
       // a watcher event the SSE never delivered).
       void refreshFileTree?.();
     },
-    [reloadPreview, reloadSdkSession, refreshFileTree],
+    [onAcceptedPersistedFileChange, reloadPreview, reloadSdkSession, refreshFileTree],
   );
 
   const persistSnapshotInOrder = useCallback(async (write: () => Promise<void>) => {
@@ -265,41 +287,59 @@ export function useExternalFileChangeCoordinator({
       if (!path) return;
 
       const generation = ++generationRef.current;
+      const savingPath = getPendingCandidate?.()?.path;
       const result = await drainPendingChanges();
       if (!mountedRef.current || generation !== generationRef.current) return;
 
       if (result.status === "clean") {
         const previousBlocked = blockedRef.current;
-        if (previousBlocked?.status === "failed" && deleteConflictSnapshot) {
+        // Only saving the failed draft's file retires its copy; restored drafts are never queued.
+        if (
+          previousBlocked?.status === "failed" &&
+          !previousBlocked.recovered &&
+          previousBlocked.path === savingPath &&
+          deleteConflictSnapshot
+        ) {
           try {
-            await deleteConflictSnapshot(projectId!, path);
+            await deleteConflictSnapshot(projectId!, previousBlocked.path);
           } catch (error) {
             if (mountedRef.current && generation === generationRef.current) {
-              setBlocked({ ...previousBlocked, generation, error });
+              setBlocked({
+                ...previousBlocked,
+                generation,
+                error,
+                payload: mergeFileChangePayloads(payload, previousBlocked.payload),
+              });
             }
             return;
           }
         }
         if (!mountedRef.current || generation !== generationRef.current) return;
         setBlocked(null);
-        onAcceptedPersistedFileChange(path, readFileChangeAffectedCompositions(payload));
-        reloadAcceptedGeneration(path, readFileChangeAffectsPreview(payload));
+        const restored = previousBlocked?.status === "failed" && previousBlocked.recovered;
+        deliverOwed(
+          previousBlocked && !restored
+            ? mergeFileChangePayloads(previousBlocked.payload, payload)
+            : payload,
+        );
         return;
       }
-      const content = readFileChangeContent(payload);
       if (result.status === "failed") {
+        // The draft names the file to recover; the payload stays the scope to reload.
         const candidate = getPendingCandidate?.();
-        const studioContent = candidate?.path === path ? candidate.content : null;
+        const failedPath = candidate?.path ?? (path === "." ? (recoveryFilePath ?? path) : path);
+        const studioContent = candidate?.content ?? null;
+        const external = failedPath === path ? payload : null;
         let error = result.error;
         if (studioContent != null && persistFailureSnapshot) {
           try {
             await persistSnapshotInOrder(() =>
               persistFailureSnapshot(
                 projectId!,
-                path,
+                failedPath,
                 studioContent,
-                readFileChangeVersion(payload),
-                content,
+                readFileChangeVersion(external),
+                readFileChangeContent(external),
                 result.error,
               ),
             );
@@ -316,7 +356,7 @@ export function useExternalFileChangeCoordinator({
         setBlocked({
           status: "failed",
           generation,
-          path,
+          path: failedPath,
           error,
           payload,
           studioContent,
@@ -331,7 +371,7 @@ export function useExternalFileChangeCoordinator({
         setBlocked({
           status: "failed",
           generation,
-          path,
+          path: result.error.filePath,
           error,
           payload,
           studioContent: result.error.attemptedContent,
@@ -344,16 +384,20 @@ export function useExternalFileChangeCoordinator({
     },
     [
       drainPendingChanges,
+      setBlocked,
       projectId,
       deleteConflictSnapshot,
       getPendingCandidate,
+      recoveryFilePath,
       persistConflictSnapshot,
       persistFailureSnapshot,
       persistSnapshotInOrder,
-      reloadAcceptedGeneration,
-      onAcceptedPersistedFileChange,
+      deliverOwed,
     ],
   );
+
+  const drainOnePendingRef = useRef(drainOnePending);
+  drainOnePendingRef.current = drainOnePending;
 
   const startDrainLoop = useCallback(async () => {
     if (drainingRef.current) return;
@@ -363,12 +407,12 @@ export function useExternalFileChangeCoordinator({
         const pending = pendingPayloadRef.current;
         if (!pending) break;
         pendingPayloadRef.current = null;
-        await drainOnePending(pending.payload);
+        await drainOnePendingRef.current(pending.payload);
       }
     } finally {
       drainingRef.current = false;
     }
-  }, [drainOnePending]);
+  }, []);
 
   const processChange = useCallback(
     // fallow-ignore-next-line complexity
@@ -419,15 +463,21 @@ export function useExternalFileChangeCoordinator({
         waiting != null &&
         readFileChangeAffectsPreview(waiting) &&
         !readFileChangeAffectsPreview(payload);
-      if (!waitingChangeOutranksThis) pendingPayloadRef.current = { payload };
+      if (!waitingChangeOutranksThis) {
+        pendingPayloadRef.current = {
+          payload: waiting == null ? payload : mergeFileChangePayloads(waiting, payload),
+        };
+      }
       void startDrainLoop();
     },
     [projectId, pendingTimelineEditPathRef, startDrainLoop, onAcceptedPersistedFileChange],
   );
 
+  const processChangeRef = useRef(processChange);
+  processChangeRef.current = processChange;
   useEffect(() => {
     // One decoder for all three transports; the rungs only choose the channel.
-    const handler = (delivery?: unknown) => processChange(decodeFileChange(delivery));
+    const handler = (delivery?: unknown) => processChangeRef.current(decodeFileChange(delivery));
     const adapter = testHotAdapter();
     if (adapter) {
       adapter.on("hf:file-change", handler);
@@ -437,8 +487,9 @@ export function useExternalFileChangeCoordinator({
       import.meta.hot.on("hf:file-change", handler);
       return () => import.meta.hot?.off?.("hf:file-change", handler);
     }
-    return sseFileChangeChannel(handler);
-  }, [processChange]);
+    const catchUp = () => processChangeRef.current({ path: "." });
+    return sseFileChangeChannel(handler, catchUp);
+  }, []);
 
   const retry = useCallback(async () => {
     const current = blockedRef.current;
@@ -464,17 +515,16 @@ export function useExternalFileChangeCoordinator({
       onUseExternalFile?.(path, external);
       await deleteConflictSnapshot?.(projectId, path);
       setBlocked(null);
-      onAcceptedPersistedFileChange(path, readFileChangeAffectedCompositions(current.payload));
-      reloadAcceptedGeneration(path, readFileChangeAffectsPreview(current.payload));
+      deliverOwed(current.payload);
     },
     [
       deleteConflictSnapshot,
+      setBlocked,
       discardPendingChanges,
       onUseExternalFile,
-      onAcceptedPersistedFileChange,
       projectId,
       readProjectFile,
-      reloadAcceptedGeneration,
+      deliverOwed,
       resetSaveQueues,
     ],
   );
@@ -524,14 +574,18 @@ export function useExternalFileChangeCoordinator({
     resetSaveQueues?.();
     await deleteConflictSnapshot?.(projectId, conflict.filePath);
     setBlocked(null);
-    reloadAcceptedGeneration(conflict.filePath);
+    deliverOwed(
+      mergeFileChangePayloads(current.payload, { path: conflict.filePath, affectsPreview: true }),
+      readStudioFileChangePath(current.payload) !== conflict.filePath,
+    );
   }, [
     deleteConflictSnapshot,
+    setBlocked,
     discardPendingChanges,
     overwriteConflict,
     projectId,
     readProjectFile,
-    reloadAcceptedGeneration,
+    deliverOwed,
     resetSaveQueues,
   ]);
 

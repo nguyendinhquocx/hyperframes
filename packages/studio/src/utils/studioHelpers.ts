@@ -4,6 +4,8 @@ import type { TimelineElement } from "../player/store/playerStore";
 import type { DomEditSelection } from "../components/editor/domEditing";
 import type { TimelineAssetKind } from "./timelineAssetDrop";
 import { roundToCenti } from "./rounding";
+import { studioApiFetch } from "./studioApiFetch";
+import { encodeUrlPath } from "@hyperframes/parsers";
 
 export interface EditingFile {
   path: string;
@@ -89,6 +91,11 @@ export function normalizeDomEditStyleValue(property: string, value: string): str
 
 export function isImageBackgroundValue(value: string): boolean {
   return /^url\(/i.test(value.trim());
+}
+
+export function cssPropertyName(property: string): string {
+  if (property.startsWith("--")) return property;
+  return property.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`).replace(/^ms-/, "-ms-");
 }
 
 export function isManualGeometryStyleProperty(property: string): boolean {
@@ -346,7 +353,7 @@ export async function resolveDroppedAssetDuration(
 
   const media = document.createElement(kind === "video" ? "video" : "audio");
   media.preload = "metadata";
-  media.src = buildProjectApiPath(projectId, `/preview/${assetPath}`);
+  media.src = buildProjectApiPath(projectId, `/preview/${encodeUrlPath(assetPath)}`);
 
   const duration = await new Promise<number>((resolve) => {
     const timeout = window.setTimeout(() => resolve(DEFAULT_TIMELINE_ASSET_DURATION[kind]), 3000);
@@ -388,13 +395,27 @@ export async function resolveDroppedAssetHasAudio(
   kind: TimelineAssetKind,
 ): Promise<boolean> {
   if (kind !== "video") return false;
+  return (await resolveAssetHasAudio(projectId, assetPath)) === true;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/** An asset's audio stream from the metadata endpoint: null when the probe can't tell. */
+export async function resolveAssetHasAudio(
+  projectId: string,
+  assetPath: string,
+): Promise<boolean | null> {
   try {
-    const response = await fetch(mediaMetadataUrl(projectId, assetPath));
-    if (!response.ok) return false;
-    const data = (await response.json()) as { metadata?: { hasAudio?: boolean } } | null;
-    return data?.metadata?.hasAudio === true;
+    const response = await studioApiFetch(mediaMetadataUrl(projectId, assetPath));
+    if (!response.ok) return null;
+    const data: unknown = await response.json();
+    const metadata = isPlainRecord(data) ? data.metadata : undefined;
+    const hasAudio = isPlainRecord(metadata) ? metadata.hasAudio : undefined;
+    return typeof hasAudio === "boolean" ? hasAudio : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -404,7 +425,7 @@ export async function resolveDroppedAssetDimensions(
   kind: TimelineAssetKind,
 ): Promise<{ width: number; height: number } | null> {
   if (kind === "audio") return null;
-  const src = buildProjectApiPath(projectId, `/preview/${assetPath}`);
+  const src = buildProjectApiPath(projectId, `/preview/${encodeUrlPath(assetPath)}`);
 
   if (kind === "image") {
     return new Promise((resolve) => {

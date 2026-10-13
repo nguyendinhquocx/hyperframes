@@ -1,6 +1,6 @@
 {
   "name": "@hyperframes/studio-server",
-  "version": "0.8.101",
+  "version": "0.8.155",
   "repository": {
     "type": "git",
     "url": "https://github.com/heygen-com/hyperframes",
@@ -87,11 +87,23 @@
       "import": "./src/helpers/proxyTranscoder.ts",
       "types": "./src/helpers/proxyTranscoder.ts"
     },
+    "./loudness": {
+      "bun": "./src/helpers/loudness.ts",
+      "node": "./dist/helpers/loudness.js",
+      "import": "./src/helpers/loudness.ts",
+      "types": "./src/helpers/loudness.ts"
+    },
     "./media-proxy-preview": {
       "bun": "./src/helpers/mediaProxyPreview.ts",
       "node": "./dist/helpers/mediaProxyPreview.js",
       "import": "./src/helpers/mediaProxyPreview.ts",
       "types": "./src/helpers/mediaProxyPreview.ts"
+    },
+    "./encoder-options": {
+      "bun": "./src/helpers/encoderOptions.ts",
+      "node": "./dist/helpers/encoderOptions.js",
+      "import": "./src/helpers/encoderOptions.ts",
+      "types": "./src/helpers/encoderOptions.ts"
     }
   },
   "publishConfig": {
@@ -146,9 +158,17 @@
         "import": "./dist/helpers/proxyTranscoder.js",
         "types": "./dist/helpers/proxyTranscoder.d.ts"
       },
+      "./loudness": {
+        "import": "./dist/helpers/loudness.js",
+        "types": "./dist/helpers/loudness.d.ts"
+      },
       "./media-proxy-preview": {
         "import": "./dist/helpers/mediaProxyPreview.js",
         "types": "./dist/helpers/mediaProxyPreview.d.ts"
+      },
+      "./encoder-options": {
+        "import": "./dist/helpers/encoderOptions.js",
+        "types": "./dist/helpers/encoderOptions.d.ts"
       }
     },
     "main": "./dist/index.js",

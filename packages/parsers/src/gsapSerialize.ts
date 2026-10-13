@@ -47,6 +47,10 @@ export function editabilityForProvenance(provenance?: GsapProvenance): KeyframeE
   return "unroll";
 }
 
+export function authorsKeyframes(anim: GsapAnimation): boolean {
+  return anim.keyframes !== undefined || anim.hasUnresolvedKeyframes === true;
+}
+
 export interface GsapAnimation {
   id: string;
   targetSelector: string;
@@ -62,6 +66,12 @@ export interface GsapAnimation {
   ease?: string;
   /** Non-editable GSAP config (stagger, yoyo, repeat, etc.) preserved for round-trips. */
   extras?: Record<string, unknown>;
+  inspectionTiming?: {
+    repeat: number | null;
+    repeatDelay: number | null;
+    delay: number | null;
+    stagger: { each: number } | { amount: number } | null;
+  };
   /** Native GSAP keyframes data — present when the tween uses keyframes: { ... }. */
   keyframes?: GsapKeyframesData;
   /** Arc motion path config — present when the tween uses motionPath for curved position interpolation. */
@@ -144,6 +154,7 @@ export interface GsapKeyframesData<K extends GsapPercentageKeyframe = GsapPercen
   keyframes: K[];
   ease?: string;
   easeEach?: string;
+  fromMotionPath?: true;
 }
 
 export interface ArcPathSegment {
@@ -315,6 +326,12 @@ export function serializeValue(value: unknown): string {
   }
   if (typeof value === "string") return JSON.stringify(value);
   return String(value);
+}
+
+export function plainPercentKey(percentage: number): string {
+  const text =
+    Math.abs(percentage) < 1e-6 ? percentage.toFixed(20).replace(/\.?0+$/, "") : String(percentage);
+  return `${text}%`;
 }
 
 export function safeJsKey(key: string): string {

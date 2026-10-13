@@ -6,14 +6,15 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
-import { basename } from "node:path";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { debuglog } from "node:util";
+import { basename, dirname, join, relative } from "node:path";
 import { chromeMajorCeiling, exceedsChromeCeiling } from "@hyperframes/engine/chrome-host-ceiling";
 import { normalizeErrorMessage } from "../utils/errorMessage.js";
 import { runRenderSetupWorker } from "../utils/cancellableProcess.js";
@@ -244,8 +245,7 @@ export interface BrowserResult {
 
 export interface EnsureBrowserOptions {
   onProgress?: (downloadedBytes: number, totalBytes: number) => void;
-  // Purge any cached HF-managed download before resolving, so a stale or
-  // partially-extracted install can't make the retry look like a no-op.
+  // Re-download the managed build even when cached; only its version dir is replaced.
   force?: boolean;
   // Always resolve to OUR pinned `CHROME_VERSION` build (cached, or freshly
   // downloaded) — skip both the shared puppeteer-cache preference (some other
@@ -264,23 +264,6 @@ export interface EnsureBrowserOptions {
 interface CacheLookupResult {
   result?: BrowserResult;
   staleHyperframesCachePath?: string;
-  // Root install-folder path for the stale entry (InstalledBrowser#path), NOT
-  // the missing executablePath above — this is what actually needs deleting.
-  staleInstallPath?: string;
-}
-
-/**
- * Remove one browser version's install directory (not the whole CACHE_DIR).
- * @puppeteer/browsers' install() treats an existing-but-incomplete directory
- * as already installed and throws "folder exists but executable is missing"
- * rather than re-extracting — so an extraction interrupted by a Windows AV
- * lock, a sleep/wake cycle, or ctrl-C (left with only alphabetically-early
- * files like ABOUT/LICENSE, no exe) wedges every subsequent ensure/render
- * with the same error until someone manually deletes the directory. Purging
- * it first makes the retry actually retry.
- */
-function purgeStaleInstall(installPath: string): void {
-  rmSync(installPath, { recursive: true, force: true });
 }
 
 // --- Internal helpers -------------------------------------------------------
@@ -395,11 +378,11 @@ async function findFromHyperframesCache(): Promise<CacheLookupResult> {
       b.buildId === managedChromeVersion() &&
       b.platform === hostPlatform,
   );
-  if (match && existsSync(match.executablePath)) {
+  if (match && isUsableExecutable(match.executablePath)) {
     return { result: { executablePath: match.executablePath, source: "cache" } };
   }
   if (match) {
-    return { staleHyperframesCachePath: match.executablePath, staleInstallPath: match.path };
+    return { staleHyperframesCachePath: match.executablePath };
   }
   return {};
 }
@@ -516,7 +499,7 @@ function findFromPuppeteerCache(): BrowserResult | undefined {
     // keep them aligned. If puppeteer ever changes the on-disk layout the two
     // need to move together.
     const binary = join(PUPPETEER_CACHE_DIR, version, ...executable);
-    if (existsSync(binary)) {
+    if (isUsableExecutable(binary)) {
       return { executablePath: binary, source: "cache" };
     }
   }
@@ -585,17 +568,14 @@ export async function findBrowser(): Promise<BrowserResult | undefined> {
   if (fromCache.result) return fromCache.result;
   if (fromCache.staleHyperframesCachePath) {
     console.warn(
-      `[browser] Cached binary missing at ${fromCache.staleHyperframesCachePath} — re-downloading...`,
+      `[browser] Cached binary unusable (missing, empty or not a file) at ${fromCache.staleHyperframesCachePath} — re-downloading...`,
     );
     try {
-      return await withInstallLock(async () => {
-        if (fromCache.staleInstallPath) purgeStaleInstall(fromCache.staleInstallPath);
-        return downloadBrowser();
-      });
+      return await withInstallLock(() => downloadBrowser());
     } catch (err) {
       const cause = normalizeErrorMessage(err);
       throw new Error(
-        `Cached Chrome binary was missing at ${fromCache.staleHyperframesCachePath}, and re-download failed: ${cause}\n` +
+        `Cached Chrome binary was unusable at ${fromCache.staleHyperframesCachePath}, and re-download failed: ${cause}\n` +
           `Run \`hyperframes browser ensure --force\` to re-download.`,
       );
     }
@@ -682,12 +662,9 @@ async function ensureBrowserInCurrentProcess(
     if (fromCache.result) return fromCache.result;
     if (fromCache.staleHyperframesCachePath) {
       console.warn(
-        `[browser] Cached binary missing at ${fromCache.staleHyperframesCachePath} — re-downloading...`,
+        `[browser] Cached binary unusable (missing, empty or not a file) at ${fromCache.staleHyperframesCachePath} — re-downloading...`,
       );
-      return withInstallLock(async () => {
-        if (fromCache.staleInstallPath) purgeStaleInstall(fromCache.staleInstallPath);
-        return downloadBrowser(options);
-      });
+      return withInstallLock(() => downloadBrowser(options));
     }
 
     if (!options?.preferManagedChrome) {
@@ -700,24 +677,15 @@ async function ensureBrowserInCurrentProcess(
   }
 
   return withInstallLock(async () => {
-    if (options?.force) {
-      // `--force` means "always get a fresh managed download" — purging the
-      // whole HF-managed cache after acquiring the install lock keeps two
-      // concurrent force retries from deleting each other's in-flight lock or
-      // partially extracted install.
-      clearBrowser();
-    }
-
     // Re-check after acquiring the lock: a concurrent invocation may have
     // finished installing while we were waiting, in which case reuse its
     // result instead of downloading and extracting a second time. Skipped
-    // under --force, which already purged and always wants a fresh download.
+    // under --force, which always wants a fresh download.
     if (!options?.force) {
       const afterLock = await (options?.preferManagedChrome
         ? findFromHyperframesCache()
         : findFromCache());
       if (afterLock.result) return afterLock.result;
-      if (afterLock.staleInstallPath) purgeStaleInstall(afterLock.staleInstallPath);
     }
     return downloadBrowser(options);
   });
@@ -811,11 +779,15 @@ function browserPathHintForPlatform(): string {
   return "/usr/bin/google-chrome";
 }
 
-function wrapDownloadFailureWithBrowserPathHint(cause: unknown): Error {
+function wrapDownloadFailureWithBrowserPathHint(
+  cause: unknown,
+  unzipLog: readonly string[],
+): Error {
   const original = normalizeErrorMessage(cause);
+  const unzipErrors = unzipLog.length > 0 ? ` Unzip errors: ${unzipLog.join("; ")}` : "";
   const example = browserPathHintForPlatform();
   const message =
-    `Failed to download chrome-headless-shell ${managedChromeVersion()}: ${original}\n\n` +
+    `Failed to install chrome-headless-shell ${managedChromeVersion()}: ${original}${unzipErrors}\n\n` +
     `Point hyperframes at an already-installed Chrome/Chromium instead:\n\n` +
     `  export HYPERFRAMES_BROWSER_PATH="${example}"\n\n` +
     `Then re-run your command. Any Chrome build works for the screenshot ` +
@@ -837,43 +809,124 @@ async function downloadBrowser(options?: EnsureBrowserOptions): Promise<BrowserR
     throw new Error(`Unsupported platform: ${process.platform} ${process.arch}`);
   }
 
-  const runInstall = () =>
-    install({
-      cacheDir: CACHE_DIR,
+  // Callers hold the install lock, so every leftover belongs to an install that was killed mid-way.
+  removeInstallLeftovers();
+  // Same filesystem as CACHE_DIR so the final rename is atomic.
+  const stagingDir = join(CACHE_ROOT_DIR, `${STAGING_PREFIX}${randomUUID()}`);
+  const clearStaging = () => rmSync(stagingDir, { recursive: true, force: true });
+  // install() only debug-logs each failed unzip tool before trying the next one; keep those lines.
+  let unzipLog: string[] = [];
+  const runInstall = () => {
+    unzipLog = [];
+    return install({
+      cacheDir: stagingDir,
       browser: Browser.CHROMEHEADLESSSHELL,
       buildId: managedChromeVersion(),
       platform,
       downloadProgressCallback: options?.onProgress,
-    });
-
-  let installed;
-  try {
-    installed = await installWithCorruptArchiveRecovery(
-      runInstall,
-      () => {
-        rmSync(CACHE_DIR, { recursive: true, force: true });
-        mkdirSync(CACHE_DIR, { recursive: true });
+      logger: (prefix) => {
+        const debug = debuglog(prefix);
+        const isUnzip = prefix === "puppeteer:browsers:fileUtil";
+        if (!isUnzip && !debug.enabled) return undefined;
+        return (...args) => {
+          const line = args.join(" ");
+          if (isUnzip) unzipLog.push(line);
+          if (debug.enabled) debug(line);
+        };
       },
-      (err) =>
-        console.warn(
-          `[hyperframes] Cached browser archive was corrupt (${normalizeErrorMessage(err)}); clearing the cache and re-downloading.`,
-        ),
-    );
-  } catch (err) {
-    throw wrapDownloadFailureWithBrowserPathHint(err);
-  }
+    });
+  };
 
-  return { executablePath: installed.executablePath, source: "download" };
+  try {
+    const staged = await installWithCorruptArchiveRecovery(runInstall, clearStaging, (err) =>
+      console.warn(
+        `[hyperframes] Downloaded browser archive was corrupt (${normalizeErrorMessage(err)}); re-downloading.`,
+      ),
+    );
+    assertExecutableUnpacked(stagingDir, staged.executablePath);
+    unzipLog = [];
+    return { executablePath: moveStagedInstallIntoCache(stagingDir, staged), source: "download" };
+  } catch (err) {
+    throw wrapDownloadFailureWithBrowserPathHint(err, unzipLog);
+  } finally {
+    clearStaging();
+  }
 }
 
-/**
- * Remove the cached Chrome download directory.
- * Returns true if anything was removed.
- */
-export function clearBrowser(): boolean {
-  if (!existsSync(CACHE_DIR)) {
+function executableState(path: string): "usable" | "is missing" | "is empty" | "is not a file" {
+  const stat = statSync(path, { throwIfNoEntry: false });
+  if (!stat) return "is missing";
+  if (!stat.isFile()) return "is not a file";
+  return stat.size > 0 ? "usable" : "is empty";
+}
+
+function isUsableExecutable(path: string): boolean {
+  try {
+    return executableState(path) === "usable";
+  } catch {
     return false;
   }
+}
+
+// install() returns without checking that the unzip produced the executable.
+function assertExecutableUnpacked(stagingDir: string, executablePath: string): void {
+  const state = executableState(executablePath);
+  if (state === "usable") return;
+  throw new Error(
+    `the archive downloaded, but ${relative(stagingDir, executablePath)} ${state} after unzipping.`,
+  );
+}
+
+// Swap one staged version dir into CACHE_DIR by rename, never deleting the cache under live users:
+// a running old binary keeps its inode, and a stale partial extract (exe missing) is replaced too.
+function moveStagedInstallIntoCache(
+  stagingDir: string,
+  staged: { path: string; executablePath: string },
+): string {
+  const target = join(CACHE_DIR, relative(stagingDir, staged.path));
+  const aside = join(CACHE_ROOT_DIR, `${REPLACED_PREFIX}${randomUUID()}`);
+  mkdirSync(dirname(target), { recursive: true });
+  let replaced = false;
+  try {
+    renameSync(target, aside);
+    replaced = true;
+  } catch (err) {
+    if (!isErrno(err, "ENOENT")) throw err;
+  }
+  try {
+    renameSync(staged.path, target);
+  } catch (err) {
+    if (replaced) renameSync(aside, target);
+    throw err;
+  }
+  if (replaced) rmSync(aside, { recursive: true, force: true });
+  return join(target, relative(staged.path, staged.executablePath));
+}
+
+const STAGING_PREFIX = ".chrome-staging-";
+const REPLACED_PREFIX = ".chrome-replaced-";
+
+// Staging and set-aside dirs outlive an install killed by a signal, since `finally` never runs.
+function removeInstallLeftovers(): boolean {
+  let names: string[];
+  try {
+    names = readdirSync(CACHE_ROOT_DIR);
+  } catch (err) {
+    if (isErrno(err, "ENOENT")) return false;
+    throw err;
+  }
+  const leftovers = names.filter(
+    (name) => name.startsWith(STAGING_PREFIX) || name.startsWith(REPLACED_PREFIX),
+  );
+  for (const name of leftovers)
+    rmSync(join(CACHE_ROOT_DIR, name), { recursive: true, force: true });
+  return leftovers.length > 0;
+}
+
+// Deletes the managed Chrome cache and interrupted-install leftovers; true when any of them existed.
+export function clearBrowser(): boolean {
+  const removedLeftovers = removeInstallLeftovers();
+  if (!existsSync(CACHE_DIR)) return removedLeftovers;
   rmSync(CACHE_DIR, { recursive: true, force: true });
   return true;
 }

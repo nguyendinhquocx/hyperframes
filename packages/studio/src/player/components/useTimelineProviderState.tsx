@@ -72,6 +72,7 @@ export function useTimelineProviderState({
   onDuplicateClip,
   canPasteClip,
   clipMenuItems,
+  splitShortcut,
   theme: themeOverrides,
   showAudioEffects = true,
   showKeyframes = true,
@@ -86,6 +87,7 @@ export function useTimelineProviderState({
     onResizeElement,
     onResizeElements,
     onBlockedEditAttempt,
+    onLinkEdit,
     onSplitElement,
     onRazorSplitAll,
     onDeleteKeyframe,
@@ -105,6 +107,7 @@ export function useTimelineProviderState({
   const readOnlyPress = useTimelineReadOnlyPress();
   const oneShotEdits = refuseWhenReadOnly(readOnlyPress, {
     onBlockedEditAttempt,
+    onLinkEdit,
     onRazorSplitAll,
     onToggleTrackHidden: editContext.onToggleTrackHidden,
     onTogglePropertyGroupKeyframe: editContext.onTogglePropertyGroupKeyframe,
@@ -128,7 +131,7 @@ export function useTimelineProviderState({
   const timelineSessionEpoch = usePlayerStore((s) => s.timelineSessionEpoch);
   const sessionEpoch = sessionEpochProp ?? timelineSessionEpoch;
   const setFocusedEaseSegment = usePlayerStore((s) => s.setFocusedEaseSegment);
-  const { zoomMode, manualZoomPercent, setZoomMode, setManualZoomPercent } = useTimelineZoom();
+  const { zoomMode, manualZoomPercent } = useTimelineZoom();
   const playheadRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -153,6 +156,7 @@ export function useTimelineProviderState({
     trackStyles,
     trackOrder,
     trackOrderRef,
+    trackInsertLayoutRef,
     laneCounts,
     rowGeometry,
     rowGeometryRef,
@@ -211,13 +215,14 @@ export function useTimelineProviderState({
     ppsRef,
     durationRef,
     trackOrderRef,
+    trackInsertLayoutRef,
     rowGeometryRef,
     onMoveElement: pinnedOnMoveElement,
     onMoveElements: pinnedOnMoveElements,
     onResizeElement: pinnedOnResizeElement,
     onResizeElements: pinnedOnResizeElements,
     onBlockedEditAttempt: oneShotEdits.onBlockedEditAttempt,
-    onSeek,
+    onLinkEdit: oneShotEdits.onLinkEdit,
     setShowPopover,
     setRangeSelectionRef,
     readZIndex: zSyncEnabled ? readClipZIndex : undefined,
@@ -253,22 +258,21 @@ export function useTimelineProviderState({
       timelineElements.length,
       displayLayout.totalH,
     ]);
-  const { pps, fitPps, displayContentWidth, displayDuration, zoomModeRef, manualZoomPercentRef } =
-    useTimelineGeometry({
-      viewportWidth: viewport.clientWidth,
-      effectiveDuration,
-      zoomMode,
-      manualZoomPercent,
-      ppsRef,
-      fitPpsRef,
-      draggedClip,
-      resizingClip,
-      expandedElements: timelineElements,
-      isDragging,
-      scrollRef,
-      lastScrollLeftRef,
-      contentOrigin,
-    });
+  const { pps, fitPps, displayContentWidth, displayDuration, zoomModeRef } = useTimelineGeometry({
+    viewportWidth: viewport.clientWidth,
+    effectiveDuration,
+    zoomMode,
+    manualZoomPercent,
+    ppsRef,
+    fitPpsRef,
+    draggedClip,
+    resizingClip,
+    expandedElements: timelineElements,
+    isDragging,
+    scrollRef,
+    lastScrollLeftRef,
+    contentOrigin,
+  });
   const timelineFocus = useTimelineLogicalFocus({
     scrollRef,
     tracks,
@@ -285,7 +289,7 @@ export function useTimelineProviderState({
     allowHorizontal: zoomMode === "manual",
     viewport,
     sessionEpoch,
-    draggedRowKey: draggedClip?.started ? draggedClip.previewTrack : undefined,
+    draggedRowKey: displayLayout.draggedRowKey,
     resizingElementIds,
     clipContextMenuRowKey: clipContextMenu?.element.track,
     keyframeContextMenuRowKey: kfContextMenu?.element.track,
@@ -332,22 +336,19 @@ export function useTimelineProviderState({
   const { seekFromX, autoScrollDuringDrag, dragScrollRaf } = useTimelinePlayhead({
     playheadRef,
     scrollRef,
+    syncScrollViewport,
     ppsRef,
     durationRef,
     isDragging,
     currentTime,
     zoomMode,
-    manualZoomPercent,
     zoomModeRef,
-    manualZoomPercentRef,
     fitPps,
     fitPpsRef,
     effectiveDuration,
     pps,
     timelineReady,
     elementsLength: timelineElements.length,
-    setZoomMode,
-    setManualZoomPercent,
     onSeek,
     contentOrigin,
   });
@@ -382,6 +383,7 @@ export function useTimelineProviderState({
     onDuplicateClip,
     canPasteClip,
     clipMenuItems,
+    splitShortcut,
     onSelectElement,
     selectedElementId,
     setRangeSelectionRef,
@@ -417,7 +419,6 @@ export function useTimelineProviderState({
     gapHighlight,
     openGapMenu,
     onContextMenuClip,
-    shiftClickClipRef,
     marqueeRect,
     isScrubbing,
     handlePointerDown,
@@ -500,7 +501,6 @@ export function useTimelineProviderState({
     setResizingClip,
     setDraggedClip,
     setSelectedElementId,
-    shiftClickClipRef,
     getPreviewElement,
     getTrackStyle,
     keyframeCache,

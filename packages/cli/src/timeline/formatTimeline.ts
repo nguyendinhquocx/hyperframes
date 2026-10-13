@@ -6,7 +6,7 @@ const n = (v: number) => String(Math.round(v * 1000) / 1000);
 function bar(row: TimelineRow, total: number): string {
   if (total <= 0) return " ".repeat(BAR_WIDTH);
   const known = row.durationAuthored || row.duration > 0;
-  const from = Math.min(BAR_WIDTH - 1, Math.floor((row.absStart / total) * BAR_WIDTH));
+  const from = Math.max(0, Math.min(BAR_WIDTH - 1, Math.floor((row.absStart / total) * BAR_WIDTH)));
   const to = known ? (row.absEnd / total) * BAR_WIDTH : BAR_WIDTH;
   const width = Math.max(1, Math.min(BAR_WIDTH, Math.ceil(to)) - from);
   const fill = known ? "█" : "░";
@@ -29,6 +29,11 @@ function durationNote(row: TimelineRow): string | false {
   }
 }
 
+function syncNote(frames: number | null): string | false {
+  if (!frames) return false;
+  return `out-of-sync=${frames > 0 ? "+" : ""}${frames}f`;
+}
+
 function details(row: TimelineRow): string {
   const lanes = row.lanes.map(
     (l) => `${l.target}[${l.points.map((p) => `${n(p.t)}:${n(p.v)}`).join(" ")}]`,
@@ -38,6 +43,7 @@ function details(row: TimelineRow): string {
     row.volume !== null && `vol=${row.volume}`,
     row.playbackRate !== null && `rate=${n(row.playbackRate)}`,
     row.audioGroup && `group=${row.audioGroup}`,
+    syncNote(row.syncOffsetFrames),
     durationNote(row),
     row.sourceFile && !row.children.length && "children=unread",
     row.laneError && `lanes unreadable: ${row.laneError}`,

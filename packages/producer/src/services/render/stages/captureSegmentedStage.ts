@@ -23,7 +23,6 @@ import {
   getCapturePerfSummary,
   initializeSession,
   prepareCaptureSessionForReuse,
-  resolveHeadlessShellPath,
   shouldDisableBrowserPoolForParallelWorker,
   spawnStreamingEncoder,
   type BeforeCaptureHook,
@@ -203,7 +202,7 @@ async function captureSegmentFrames(
       ctx.captureFrame(ctx.session, i, time),
       ctx.stallTimeoutMs - (Date.now() - lastProgressAt),
       {
-        captureMode: ctx.session.captureMode,
+        session: ctx.session,
         frameIndex: i,
         totalFrames: ctx.totalFrames,
         stallTimeoutMs: ctx.stallTimeoutMs,
@@ -221,7 +220,8 @@ async function captureSegmentFrames(
         ")",
       Math.round(25 + ((i + 1) / ctx.totalFrames) * 55),
       ctx.onProgress,
-      i + 1 === ctx.totalFrames,
+      i + 1,
+      ctx.totalFrames,
     );
   }
 }
@@ -326,9 +326,6 @@ async function openSegmentedSession(input: CaptureSegmentedStageInput): Promise<
   const captureOptions = input.buildCaptureOptions();
   const ownBrowser = shouldDisableBrowserPoolForParallelWorker({
     parallel: (input.workerCount ?? 1) > 1,
-    platform: process.platform,
-    deviceScaleFactor: captureOptions.deviceScaleFactor,
-    headlessShellPath: resolveHeadlessShellPath(captureCfg),
   });
   return createCaptureSession(
     input.fileServer.url,

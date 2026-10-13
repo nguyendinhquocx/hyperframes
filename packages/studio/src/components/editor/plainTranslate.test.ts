@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
-import { describe, expect, it } from "vitest";
-import { readTranslatePx } from "./plainTranslate";
+import { describe, expect, it, vi } from "vitest";
+import { readTranslatePx, readTranslatePxLeavingPercent } from "./plainTranslate";
 
 function box(style: string): HTMLElement {
   const element = document.createElement("div");
@@ -28,17 +28,30 @@ describe("readTranslatePx", () => {
   });
 
   it.each([
-    "min(10px, 5%) 0px",
-    "calc(2 * 10px) 0px",
-    "calc(10px +) 0px",
-    "clamp(0px, 10%, 30px) 5px",
-  ])("hands %s to Chrome's own resolution and puts the element's style back", (translate) => {
-    const element = box(`translate: ${translate}; transform: rotate(5deg)`);
-    const before = element.getAttribute("style");
-    const read = readTranslatePx(element);
-    expect(Number.isFinite(read.x) && Number.isFinite(read.y)).toBe(true);
-    expect(element.getAttribute("style")).toBe(before);
+    ["min(10px, 5%) max(-20%, -40px)", { x: 10, y: -32 }],
+    ["clamp(0px, 10%, 30px) 5px", { x: 24, y: 5 }],
+    ["calc(min(50%, 100px) * 2 - (10px + 5%)) calc(-1 * clamp(10%, 1px, 20%))", { x: 178, y: -16 }],
+    ["calc(2 * 10px) calc(80px / 4)", { x: 20, y: 20 }],
+  ])("works out %s by arithmetic", (translate, want) => {
+    expect(readTranslatePx(box(`translate: ${translate}`))).toEqual(want);
   });
+
+  it.each(["calc(10px +) 0px", "abs(10% - 50px) 0px", "round(10%, 7px) 0px", "min(10px 5%) 0px"])(
+    "reads %s as NaN, never as a guess",
+    (translate) => {
+      expect(readTranslatePx(box(`translate: ${translate}`)).x).toBeNaN();
+    },
+  );
+
+  it.each(["content-box", "fill-box"])(
+    "resolves a percent against the content box under transform-box: %s",
+    (transformBox) => {
+      const element = box(
+        `translate: 50% 50%; padding: 10px; border: 5px solid; box-sizing: content-box; transform-box: ${transformBox}`,
+      );
+      expect(readTranslatePx(element)).toEqual({ x: 120, y: 80 });
+    },
+  );
 
   it("counts padding and border in the box a percent resolves against", () => {
     const element = box(
@@ -47,16 +60,38 @@ describe("readTranslatePx", () => {
     expect(readTranslatePx(element)).toEqual({ x: 135, y: 95 });
   });
 
-  it("writes nothing to the element it reads", () => {
-    const element = box("translate: -50% -50%");
-    const before = element.getAttribute("style");
-    const writes: MutationRecord[] = [];
-    const observer = new MutationObserver((records) => writes.push(...records));
-    observer.observe(element, { attributes: true });
-    readTranslatePx(element);
-    writes.push(...observer.takeRecords());
-    observer.disconnect();
-    expect(writes).toEqual([]);
-    expect(element.getAttribute("style")).toBe(before);
+  it.each(["-50% -50%", "min(10px, 5%) clamp(0px, 10%, 30px)"])(
+    "writes nothing to the element while it reads %s",
+    (translate) => {
+      const element = box(`translate: ${translate}; transform: rotate(5deg)`);
+      const before = element.getAttribute("style");
+      const writes: MutationRecord[] = [];
+      const observer = new MutationObserver((records) => writes.push(...records));
+      observer.observe(element, { attributes: true });
+      readTranslatePx(element);
+      writes.push(...observer.takeRecords());
+      observer.disconnect();
+      expect(writes).toEqual([]);
+      expect(element.getAttribute("style")).toBe(before);
+    },
+  );
+});
+
+describe("readTranslatePxLeavingPercent", () => {
+  it("seeds a first tween from the px a plain move left in CSS translate, leaving % to xPercent", () => {
+    const el = document.body.appendChild(document.createElement("div"));
+    // happy-dom computes no `translate`; Chromium resolves it to these strings.
+    const computed = (translate: string) =>
+      vi.spyOn(window, "getComputedStyle").mockReturnValue({ translate } as CSSStyleDeclaration);
+    computed("299.893px 203.262px");
+    expect(readTranslatePxLeavingPercent(el)).toEqual({ x: 299.893, y: 203.262 });
+    computed("calc(-50% + 120px) -50%");
+    expect(readTranslatePxLeavingPercent(el)).toEqual({ x: 120, y: 0 });
+    computed("calc(-50% - 120px) calc(min(10px, 20px) + 5px)");
+    expect(readTranslatePxLeavingPercent(el)).toEqual({ x: -120, y: 15 });
+    computed("none");
+    expect(readTranslatePxLeavingPercent(el)).toEqual({ x: 0, y: 0 });
+    vi.restoreAllMocks();
+    el.remove();
   });
 });

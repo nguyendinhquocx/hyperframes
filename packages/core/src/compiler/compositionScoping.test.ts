@@ -11,6 +11,38 @@ import {
 } from "./compositionScoping";
 
 describe("composition scoping", () => {
+  it("reports the child source before authored code and finishes after a thrown script", () => {
+    const { document } = parseHTML('<main data-composition-id="scene"></main>');
+    const events: string[] = [];
+    const fakeWindow = {
+      document,
+      __timelines: {},
+      events,
+      __hfScriptState: (phase: string, source: string) => events.push(`${phase}:${source}`),
+    };
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const wrapped = wrapScopedCompositionScript(
+        'window.events.push("body"); throw new Error("authored failure");',
+        "scene",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        "compositions/scene.html",
+      );
+      new Function("window", wrapped)(fakeWindow);
+      expect(events).toEqual([
+        "start:compositions/scene.html",
+        "body",
+        "finish:compositions/scene.html",
+      ]);
+      expect(error).toHaveBeenCalledOnce();
+    } finally {
+      error.mockRestore();
+    }
+  });
+
   it("scopes regular selectors while preserving global at-rules", () => {
     const scoped = scopeCssToComposition(
       `
@@ -166,6 +198,19 @@ body { margin: 0; }
     new Function("window", wrapped)(fakeWindow);
 
     expect(fakeWindow.__captured).toEqual({ title: "Pro", price: "$29" });
+  });
+
+  it("keeps a classic authored script in sloppy mode", () => {
+    const { document } = parseHTML(`<div data-composition-id="scene"></div>`);
+    const fakeWindow: Record<string, unknown> = { document, __timelines: {} };
+    const wrapped = wrapScopedCompositionScript(
+      `window.__captured = (function() { return this !== undefined; })();`,
+      "scene",
+    );
+
+    new Function("window", wrapped)(fakeWindow);
+
+    expect(fakeWindow.__captured).toBe(true);
   });
 
   it("gives a mounted module script its composition's own __hyperframes", () => {
@@ -1302,8 +1347,9 @@ describe("composition scoping – renamed-id selector runtime", () => {
     const window = dom.window as unknown as Window & typeof globalThis & Record<string, unknown>;
     window.__captured = {};
     if (gsap) window.gsap = gsap;
+    const nativeQuery = window.Element.prototype.querySelector;
     window.eval(wrapScopedCompositionScript(script, compId));
-    return { window, captured: window.__captured as Record<string, unknown> };
+    return { window, nativeQuery, captured: window.__captured as Record<string, unknown> };
   }
 
   const TWO_INSTANCES = `
@@ -1313,17 +1359,17 @@ describe("composition scoping – renamed-id selector runtime", () => {
     </div>`;
 
   it("leaves Element.prototype untouched when no id was renamed", () => {
-    const { window, captured } = bootWindow(
+    const { window, captured, nativeQuery } = bootWindow(
       `<div data-composition-id="scene"><svg><path id="shape"/></svg></div>`,
       `window.__captured.hit = document.querySelector("svg").querySelector("#shape");`,
       "scene",
     );
-    expect(window.__hfRenamedIdSelectorShim).toBeUndefined();
+    expect(window.Element.prototype.querySelector).toBe(nativeQuery);
     expect(captured.hit).toBe(window.document.querySelector("path"));
   });
 
   it("rewrites #authoredId to match a renamed element from element and document lookups", () => {
-    const { window, captured } = bootWindow(
+    const { window, captured, nativeQuery } = bootWindow(
       TWO_INSTANCES,
       `var svg = document.querySelector("svg.art");
        window.__captured.viaElement = svg.querySelector("#shape");
@@ -1336,7 +1382,7 @@ describe("composition scoping – renamed-id selector runtime", () => {
     );
     const renamed = window.document.querySelector('[data-hf-authored-id="shape"]');
     const other = window.document.querySelector('[data-composition-id="other"] path');
-    expect(window.__hfRenamedIdSelectorShim).toBe(true);
+    expect(window.Element.prototype.querySelector).not.toBe(nativeQuery);
     expect(captured.viaElement).toBe(renamed);
     expect(captured.viaElementAll).toBe(1);
     expect(captured.viaDocument).toBe(renamed);
@@ -1399,10 +1445,11 @@ describe("composition scoping – renamed-id selector runtime", () => {
     expect(captured.suffix).toBeNull();
   });
 
-  it("refreshes renamed ids after a scene is replaced and its script runs again", () => {
+  it("uses the lifecycle alias refresh before a replaced scene script runs", () => {
     const { window } = bootWindow(TWO_INSTANCES, "", "scene");
     window.document.querySelector('[data-composition-id="scene"]')!.innerHTML =
       '<svg><path id="scene--new" data-hf-authored-id="new"/></svg>';
+    window.__hfSvgSelectorAliases!.refresh();
     window.eval(
       wrapScopedCompositionScript(
         'window.__captured.hit = document.querySelector("svg").querySelector("#new").id;',

@@ -1,7 +1,12 @@
+import type { GeometryCommitResult } from "../utils/previewFeatureUsage";
+import type { RotationCommit } from "../components/editor/rotationDraft";
 import { useCallback, useMemo, useRef, useState } from "react";
 import type { GsapAnimation } from "@hyperframes/core/gsap-parser";
 import type { DomEditSelection } from "../components/editor/domEditing";
-import type { DomEditGroupPathOffsetCommit } from "../components/editor/DomEditOverlay";
+import type {
+  DomEditGroupPathOffsetCommit,
+  MoveCommitOptions,
+} from "../components/editor/DomEditOverlay";
 import { isPreviewBooted } from "../player/store/playerStore";
 import type { DomEditCommitOutcome } from "./domEditCommitRunner";
 import type { UseDomStyleCommitOptions } from "./useDomStyleCommit";
@@ -13,23 +18,23 @@ import { useGsapCacheVersion } from "./useGsapTweenCache";
 import { createDomEditSaveQueue } from "../utils/domEditSaveQueue";
 import { useDomEditPersist } from "./useDomEditPersist";
 import { useDomEditPositionPatchCommit } from "./useDomEditPositionPatchCommit";
+import { useDomGeometryCommits } from "./useDomGeometryCommits";
 import { useMountEffect } from "./useMountEffect";
-import { stageElementOffset } from "./elementOffsetStager";
 
 /**
  * Studio's `Player` must show the project, with `beginTimelineSession(projectId)` run before it
  * mounts; drain `waitForPendingSaves` before switching projects.
  */
 export interface UseDomGeometryCommitOptions extends UseDomStyleCommitOptions {
-  /** Called when a save cannot patch the preview in place; defaults to reloading the iframe. */
-  reloadPreview?: () => void;
+  /** Reloads the host's preview when a save cannot patch it in place. */
+  reloadPreview: () => void;
 }
 
 export interface DomGeometryCommits {
   commitPathOffset: (
     selection: DomEditSelection,
     next: { x: number; y: number },
-    modifiers?: { altKey?: boolean },
+    modifiers?: MoveCommitOptions,
   ) => Promise<DomEditCommitOutcome>;
   commitGroupPathOffset: (updates: DomEditGroupPathOffsetCommit[]) => Promise<DomEditCommitOutcome>;
   commitBoxSize: (
@@ -37,18 +42,17 @@ export interface DomGeometryCommits {
     next: { width: number; height: number },
     offset?: { x: number; y: number },
     restore?: () => void,
+    route?: { plainTranslate: boolean },
   ) => Promise<DomEditCommitOutcome>;
   commitRotation: (
     selection: DomEditSelection,
-    next: { angle: number },
+    next: RotationCommit,
   ) => Promise<DomEditCommitOutcome>;
   waitForPendingSaves: () => Promise<void>;
 }
 
 const noop = () => {};
 const NO_SELECTED_ANIMATIONS: GsapAnimation[] = [];
-// ponytail: unreachable, the GSAP writer always exists so a resize never takes the DOM route.
-const noDomBoxSizeRoute = () => Promise.reject(new Error("Resize has no DOM route here"));
 
 /**
  * Saves canvas moves, resizes and rotations through Studio's own GSAP-aware commits, for a host
@@ -65,19 +69,15 @@ export function useDomGeometryCommit({
 }: UseDomGeometryCommitOptions): DomGeometryCommits {
   const projectIdRef = useRef(projectId);
   projectIdRef.current = projectId;
-  const pending = useRef(new Set<Promise<void>>()).current;
+  const pending = useRef(new Set<Promise<GeometryCommitResult | undefined>>()).current;
   const editHistory = useMemo(() => ({ recordEdit }), [recordEdit]);
-  const reload = useCallback(
-    () => (reloadPreview ? reloadPreview() : iframeRef.current?.contentWindow?.location.reload()),
-    [reloadPreview, iframeRef],
-  );
   const { bump: bumpGsapCache } = useGsapCacheVersion();
   const gsap = useGsapScriptCommits({
     projectIdRef,
     activeCompPath,
     previewIframeRef: iframeRef,
     editHistory,
-    reloadPreview: reload,
+    reloadPreview,
     onCacheInvalidate: bumpGsapCache,
     showToast,
     writeProjectFile,
@@ -107,16 +107,12 @@ export function useDomGeometryCommit({
     },
     [commitPositionPatchToHtml, queue],
   );
-  const stageElementPositionOffset = useCallback(
-    (selection: DomEditSelection, next: { x: number; y: number }, coalesceKey?: string) =>
-      stageElementOffset(
-        { commitPositionPatchToHtml: commitWithFreshQueue, showToast },
-        selection,
-        next,
-        coalesceKey,
-      ),
-    [commitWithFreshQueue, showToast],
-  );
+  const { stageElementPositionOffset, handleDomBoxSizeCommit, handleDomRotationCommit } =
+    useDomGeometryCommits({
+      showToast,
+      commitPositionPatchToHtml: commitWithFreshQueue,
+      readOnlyPreview: false,
+    });
   const makeFetchFallback = useGsapAnimationFetchFallback(projectId);
   const trackGsapInteractionFailure = useGsapInteractionFailureTelemetry(activeCompPath, showToast);
   const {
@@ -129,13 +125,15 @@ export function useDomGeometryCommit({
     domEditSelection: null,
     selectedGsapAnimations: NO_SELECTED_ANIMATIONS,
     gsapCommitMutation: gsap.commitMutation,
+    activeCompPath,
     previewIframeRef: iframeRef,
     showToast,
     bumpGsapCache,
     makeFetchFallback,
     trackGsapInteractionFailure,
     stageElementPositionOffset,
-    handleDomBoxSizeCommit: noDomBoxSizeRoute,
+    handleDomBoxSizeCommit,
+    handleDomRotationCommit,
     commitPositionPatchToHtml: commitWithFreshQueue,
     addGsapAnimation: gsap.addGsapAnimation,
     convertToKeyframes: gsap.convertToKeyframes,
@@ -143,7 +141,10 @@ export function useDomGeometryCommit({
     updateArcSegment: gsap.updateArcSegment,
   });
   const saved = useCallback(
-    async (commit: () => Promise<void>, restore = noop): Promise<DomEditCommitOutcome> => {
+    async (
+      commit: () => Promise<GeometryCommitResult | undefined>,
+      restore = noop,
+    ): Promise<DomEditCommitOutcome> => {
       const refusal = !projectIdRef.current
         ? "No project is open"
         : !isPreviewBooted(projectIdRef.current)
@@ -157,11 +158,10 @@ export function useDomGeometryCommit({
       const run = commit();
       pending.add(run);
       try {
-        await run;
+        return { ok: true, changed: (await run)?.changed === true };
       } finally {
         pending.delete(run);
       }
-      return { ok: true };
     },
     [pending, showToast],
   );
@@ -171,8 +171,8 @@ export function useDomGeometryCommit({
         saved(() => handleGsapAwarePathOffsetCommit(selection, next, modifiers)),
       commitGroupPathOffset: (updates) =>
         saved(() => handleGsapAwareGroupPathOffsetCommit(updates)),
-      commitBoxSize: (selection, next, offset, restore) =>
-        saved(() => handleGsapAwareBoxSizeCommit(selection, next, offset, restore), restore),
+      commitBoxSize: (selection, next, offset, restore, route) =>
+        saved(() => handleGsapAwareBoxSizeCommit(selection, next, offset, restore, route), restore),
       commitRotation: (selection, next) =>
         saved(() => handleGsapAwareRotationCommit(selection, next)),
       waitForPendingSaves: () => Promise.allSettled([...pending]).then(noop),

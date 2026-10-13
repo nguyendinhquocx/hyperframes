@@ -21,6 +21,7 @@ type RuntimeBridgeControlActionBase =
   | "set-native-media-sync-disabled"
   | "set-web-audio-media-disabled"
   | "set-idle-heartbeat"
+  | "set-display-scale"
   | "set-root-duration"
   | "set-play-range"
   | "stop-media"
@@ -39,6 +40,7 @@ type RuntimeBridgeControlMessageBase = {
   endSeconds?: number | null;
   disabled?: boolean;
   slow?: boolean;
+  scale?: number;
   playbackRate?: number;
   target?: HfColorGradingTarget | string | null;
   grading?: RuntimeJson;
@@ -286,6 +288,7 @@ export type RuntimeSeekOptions = {
    * engine's sub-frame tick count so a fractional sample time survives quantization.
    */
   subFrameDivisions?: number;
+  exact?: boolean;
 };
 
 export type RuntimeTimelineChildLike = {
@@ -313,6 +316,7 @@ export type RuntimeTimelineLike = {
   pause: () => void;
   seek: (timeSeconds?: number, suppressEvents?: boolean) => unknown;
   totalTime?: (timeSeconds?: number, suppressEvents?: boolean) => unknown;
+  totalDuration?: () => number;
   progress?: (value?: number, suppressEvents?: boolean) => unknown;
   time: () => number;
   duration: () => number;

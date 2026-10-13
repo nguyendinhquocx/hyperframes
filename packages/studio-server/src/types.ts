@@ -19,6 +19,7 @@ export interface RenderJobState {
   stage?: string;
   outputPath: string;
   error?: string;
+  audioLoweredDb?: number;
   /**
    * Optional abort hook set by the adapter. The cancel route calls this to
    * stop an in-flight render; adapters that can't abort may omit it (the
@@ -127,7 +128,7 @@ export interface StudioApiAdapter {
   /** Lint a single HTML string. */
   lint(
     html: string,
-    opts?: { filePath?: string; isSubComposition?: boolean },
+    opts?: { filePath?: string; isSubComposition?: boolean; compSrcPath?: string },
   ): Promise<LintResult> | LintResult;
 
   /**
@@ -170,6 +171,10 @@ export interface StudioApiAdapter {
      */
     fps: import("@hyperframes/core").Fps;
     quality: string;
+    crf?: number;
+    videoBitrate?: string;
+    videoFrameFormat?: "auto" | "jpg" | "png";
+    hdrMode?: "auto" | "force-hdr" | "force-sdr";
     jobId: string;
     /**
      * The triggering browser profile has telemetry disabled (localStorage
@@ -191,6 +196,7 @@ export interface StudioApiAdapter {
      * the same channel `hyperframes render --variables` uses.
      */
     variables?: Record<string, unknown>;
+    useGpu?: boolean;
     /**
      * Telemetry id of the browser user who triggered the render. Lets the
      * adapter attribute the server-emitted render_complete/render_error to

@@ -110,7 +110,11 @@ export default defineCommand({
     profile: { type: "string", description: "AWS profile name (default: AWS_PROFILE env)" },
 
     // deploy
-    concurrency: { type: "string", description: "Lambda reserved concurrency (default: 8)" },
+    concurrency: {
+      type: "string",
+      description:
+        "Lambda reserved concurrency, or none to remove it (default: keep the stack's; a new stack reserves none and each render runs up to 90% of the account's unreserved concurrency)",
+    },
     "chrome-source": {
       type: "string",
       description: "sparticuz | chrome-headless-shell (default: sparticuz)",
@@ -226,16 +230,9 @@ export default defineCommand({
     // The lambda subverbs dynamic-import `@hyperframes/aws-lambda` at call
     // time. We keep aws-lambda as a workspace devDependency (not a runtime
     // dep) so the published CLI install stays small for users who don't
-    // deploy to Lambda. Subverbs other than `policies` need aws-lambda;
-    // catch the missing-module error here and turn it into a friendly hint.
-    const verbsNeedingSDK = new Set([
-      "deploy",
-      "sites",
-      "render",
-      "render-batch",
-      "progress",
-      "destroy",
-    ]);
+    // deploy to Lambda. These subverbs need it and get a friendly hint when it
+    // is missing; `deploy` reports that itself and `destroy` needs only SAM.
+    const verbsNeedingSDK = new Set(["sites", "render", "render-batch", "progress"]);
     if (verbsNeedingSDK.has(subcommand)) {
       try {
         await import("@hyperframes/aws-lambda/sdk");
@@ -253,11 +250,12 @@ export default defineCommand({
     switch (subcommand) {
       case "deploy": {
         const { runDeploy } = await import("./lambda/deploy.js");
+        const { parseReservedConcurrency } = await import("./lambda/sam.js");
         await runDeploy({
           stackName,
           region: args.region as string | undefined,
           awsProfile: args.profile as string | undefined,
-          reservedConcurrency: parsePositiveInt(args.concurrency, "--concurrency"),
+          reservedConcurrency: parseReservedConcurrency(args.concurrency),
           chromeSource: parseChromeSource(args["chrome-source"]),
           lambdaMemoryMb: parsePositiveInt(args.memory, "--memory"),
           skipBuild: Boolean(args["skip-build"]),

@@ -1282,7 +1282,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
       - name: Check file sizes (max 600 lines)
         # Scoped to files THIS PR changed under packages/studio. Walking the
         # whole tree blamed every unrelated PR for pre-existing offenders.
@@ -1293,7 +1293,7 @@ jobs:
           if [ -n "${{ github.base_ref }}" ]; then
             mapfile -t files < <(
               git diff --name-only --diff-filter=ACMR \
-                HEAD^1 HEAD -- \
+                "origin/${{ github.base_ref }}...HEAD" -- \
                 'packages/studio/**/*.ts' 'packages/studio/**/*.tsx' \
                 | grep -vE '\.(test|spec)\.(ts|tsx)$|\.generated\.' || true
             )

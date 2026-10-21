@@ -251,6 +251,13 @@ async function waitForCompositionSettle(
     });
 
   await waitForLateSubresources(page, options.lateSubresourceTimeoutMs ?? CAPTURE_SETTLE_MS);
+  const { resolveConfig, waitForImagesReady } = await import("@hyperframes/engine");
+  const imageTimeoutMs = resolveConfig().playerReadyTimeout;
+  await waitForImagesReady(page, imageTimeoutMs, (sources) =>
+    console.warn(
+      `   ${c.warn("⚠")} Some images did not load within ${imageTimeoutMs}ms: ${sources}. They may show blank.`,
+    ),
+  );
   return runtimeReady;
 }
 
@@ -504,6 +511,16 @@ export async function seekCompositionTimeline(
   timeSeconds: number,
   options: SeekCompositionTimelineOptions = {},
 ): Promise<void> {
+  await seekCompositionTimelineOnly(page, timeSeconds, options);
+  await settleCompositionSeek(page, options);
+}
+
+/** The seek alone; `settleCompositionSeek` must follow, which is what finishes a blurred frame. */
+export async function seekCompositionTimelineOnly(
+  page: CompositionSeekPage,
+  timeSeconds: number,
+  options: SeekCompositionTimelineOptions = {},
+): Promise<void> {
   if (options.waitForPreferredSeekTargetMs !== undefined) {
     await waitForPreferredSeekTarget(page, options.waitForPreferredSeekTargetMs);
   }
@@ -515,7 +532,12 @@ export async function seekCompositionTimeline(
     options.exactTime === true,
     options.skipWebglDraws === true,
   );
+}
 
+export async function settleCompositionSeek(
+  page: CompositionSeekPage,
+  options: SeekCompositionTimelineOptions = {},
+): Promise<void> {
   await page.evaluate(
     async (barrier: SeekBarrierOptions) => {
       const waitForCompletion = Reflect.get(window, "__hfWaitForSeekCompletion");

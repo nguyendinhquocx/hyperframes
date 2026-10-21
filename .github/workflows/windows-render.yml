@@ -402,7 +402,7 @@ jobs:
     needs: [changes, preflight]
     if: needs.changes.outputs.code == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -480,16 +480,14 @@ jobs:
       - name: Run Studio shard ${{ matrix.studio_shard }}
         if: matrix.studio_shard
         shell: pwsh
-        timeout-minutes: 16
-        run: bun run --cwd packages/studio test -- --shard=${{ matrix.studio_shard }} --maxWorkers=2 --reporter=verbose
+        run: bun run --cwd packages/studio test -- --shard=${{ matrix.studio_shard }} --maxWorkers=2
 
       - name: Run ${{ matrix.lane }} package tests
         if: matrix.packages
         shell: pwsh
-        timeout-minutes: 16
         # Each package starts its own Vitest pool. Bound every pool so concurrent
         # package scripts cannot oversubscribe the hosted Windows runner.
-        run: bun run ${{ matrix.packages }} test -- --maxWorkers=2 --reporter=verbose
+        run: bun run ${{ matrix.packages }} test -- --maxWorkers=2
 
       - name: Verify waveform cache writes on Windows
         if: matrix.lane == 'engine-cli'

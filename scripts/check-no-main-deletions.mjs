@@ -742,6 +742,10 @@ const FALLOW_PRUNE_REASON =
 
 export const ALLOWED_DELETIONS = new Map([
   [
+    "packages/studio/src/components/renders/useRenderQueueMotionBlur.test.tsx",
+    "Studio no longer sends previewMotionBlur with renders: blur picks its tier from the page, so the test of that field goes with it",
+  ],
+  [
     "packages/cli/src/beats/headlessAnalyzer.ts",
     "the TypeScript beat tracker replaces the Chrome analyzer; the beats command decodes with ffmpeg directly",
   ],
@@ -1908,6 +1912,10 @@ export const ALLOWED_DELETIONS = new Map([
   [
     "packages/engine/src/services/frameCapture-releaseInjectedVideoMedia.browser.test.ts",
     "the revert of #5795 removes releaseInjectedVideoMedia, the only code this file tested",
+  ],
+  [
+    ".github/workflows/lambda-ffmpeg.yml",
+    "the ffmpeg build moves into lambda-arm64-image.yml, which also builds and smokes the image",
   ],
 ]);
 

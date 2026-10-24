@@ -277,6 +277,12 @@ export interface CaptureSession {
    * drawElement intermittently returns an anomalously small (blank) frame with no
    * throw; a frame far below the running median is re-captured via screenshot. */
   deFrameSizes?: number[];
+  /** Absolute floor of the serial drawElement size guard. Starts at 20000 bytes and drops to
+   * half of a small frame that redraws byte-identically. */
+  deAbsFloor?: number;
+  /** The last small drawElement frame that redrew byte-identically; an equal frame is kept
+   * without a redraw. */
+  deAcceptedSmall?: Buffer;
   /** Last non-deduped encode result, reused for a static frame on the drawElement
    * worker-encode path (mirrors `lastFrameBuffer` on the screenshot path). Only set
    * when static-frame dedup is armed on the drawElement path. */
@@ -864,13 +870,15 @@ export async function driveWarmupTicks(
       // Unlocked mode is wall-clock-bounded.
       if (!state.running) return;
     }
+    let ticked = false;
     try {
       await options.tick(state.ticks * options.intervalMs, options.intervalMs);
       state.ticks += 1;
+      ticked = true;
     } catch {
       // Page not ready yet; keep spinning.
     }
-    await sleep(options.intervalMs);
+    if (!(options.lockWarmupTicks && !state.running && ticked)) await sleep(options.intervalMs);
   }
 }
 
@@ -2021,7 +2029,7 @@ export async function pollSubCompositionTimelines(
   return scriptFailureBail ? "script_failure" : "timeout";
 }
 
-async function pollVideosReady(
+export async function pollVideosReady(
   page: Page,
   skipIds: readonly string[],
   timeoutMs: number,
@@ -2031,7 +2039,9 @@ async function pollVideosReady(
     return Boolean(
       await page.evaluate((skipIdList: readonly string[]) => {
         const skip = new Set(skipIdList);
-        const vids = Array.from(document.querySelectorAll("video")).filter((v) => !skip.has(v.id));
+        const vids = Array.from(document.querySelectorAll("video"))
+          .filter((v) => !skip.has(v.id))
+          .filter((v) => !v.closest("[data-hidden]"));
         return (
           vids.length === 0 ||
           vids.every((v) => {
@@ -2653,6 +2663,7 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
         const skip = new Set(skipIdList);
         return Array.from(document.querySelectorAll("video"))
           .filter((v) => !skip.has(v.id))
+          .filter((v) => !v.closest("[data-hidden]"))
           .filter((v) => (v as HTMLVideoElement).readyState < 2 && !(v as HTMLVideoElement).error)
           .map((v) => (v as HTMLVideoElement).src || v.getAttribute("src") || "(no src)")
           .join(", ");
@@ -2794,6 +2805,7 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
         const skip = new Set(skipIdList);
         return Array.from(document.querySelectorAll("video"))
           .filter((v) => !skip.has(v.id))
+          .filter((v) => !v.closest("[data-hidden]"))
           .filter((v) => (v as HTMLVideoElement).readyState < 2 && !(v as HTMLVideoElement).error)
           .map((v) => (v as HTMLVideoElement).src || v.getAttribute("src") || "(no src)")
           .join(", ");
@@ -4060,6 +4072,70 @@ export function resolveSessionMotionBlur(session: CaptureSession): MotionBlurPla
   return plan;
 }
 
+/**
+ * Size guard for a serial drawElement frame. A frame far below the rolling median may be a
+ * dropped paint record, which is intermittent, so the frame is drawn once more: a byte-identical
+ * redraw is real content (a flat or dark frame) and is kept, as the streaming drain guard in the
+ * producer keeps it. Segmented capture reaches only this guard, so it must judge a small frame
+ * the same way, or a render that passes in one pass fails when segmented (GH #5685). A redraw
+ * that differs and is still small throws, and the caller restarts on a fresh screenshot page.
+ */
+async function judgeSmallDrawElementFrame(
+  session: CaptureSession,
+  frameIndex: number,
+  buffer: Buffer,
+  redraw: () => Promise<Buffer>,
+): Promise<Buffer> {
+  const sizes = (session.deFrameSizes ??= []);
+  const sorted = sizes.length >= 12 ? [...sizes].sort((a, b) => a - b) : null;
+  const median = sorted ? (sorted[sorted.length >> 1] ?? 0) : 0;
+  const floor = Math.max(session.deAbsFloor ?? 20000, median * 0.12);
+  let kept = buffer;
+  if (buffer.length < floor && !session.deAcceptedSmall?.equals(buffer)) {
+    const suspect = () =>
+      new DrawElementCaptureError(
+        frameIndex,
+        `suspect small frame (${buffer.length}B < ${Math.round(floor)}B)`,
+      );
+    // Under BeginFrame control the page paints only on the frame already sent for this index,
+    // so a second draw reads the same snapshot and cannot tell a drop from real content.
+    if (session.beginFrameTimeTicks > 0) throw suspect();
+    const retry = await redraw();
+    if (retry.equals(buffer)) {
+      // Halving the floor keeps a run of similar flat frames from redrawing every frame.
+      session.deAbsFloor = Math.min(session.deAbsFloor ?? 20000, Math.floor(buffer.length / 2));
+      session.deAcceptedSmall = buffer;
+    } else if (retry.length < floor) {
+      throw suspect();
+    } else {
+      kept = retry;
+    }
+  }
+  if (sizes.length >= 60) sizes.shift();
+  sizes.push(kept.length);
+  return kept;
+}
+
+/** Seek to `time` again and draw the frame once more, for {@link judgeSmallDrawElementFrame}. */
+async function redrawDrawElementFrame(
+  session: CaptureSession,
+  frameIndex: number,
+  time: number,
+  seekOptions?: HfSeekOptions,
+  heldVideoTime?: number,
+): Promise<Buffer> {
+  const { page, options } = session;
+  await prepareFrameForCapture(session, frameIndex, time, seekOptions, heldVideoTime);
+  return captureDrawElementFrame(
+    page,
+    options.width,
+    options.height,
+    options.format ?? "jpeg",
+    options.quality ?? 80,
+    true,
+  );
+}
+
 /** Frame timings shared by the single-capture and accumulation paths. */
 interface CapturedSurface {
   buffer: Buffer;
@@ -4146,21 +4222,13 @@ async function captureFrameSurface(
       );
       // A tiny JPEG may be a dropped paint record. Never screenshot this page:
       // its injected canvas can still hold the preceding frame's bitmap.
-      // Restart on a fresh screenshot page even if this was a simple valid frame.
       if ((options.format ?? "jpeg") !== "png" && process.env.HF_FORCE_DRAWELEMENT !== "1") {
-        const sizes = (session.deFrameSizes ??= []);
-        const sorted = sizes.length >= 12 ? [...sizes].sort((a, b) => a - b) : null;
-        const median = sorted ? (sorted[sorted.length >> 1] ?? 0) : 0;
-        const floor = Math.max(20000, median * 0.12);
-        if (screenshotBuffer.length < floor) {
-          throw new DrawElementCaptureError(
-            frameIndex,
-            `suspect small frame (${screenshotBuffer.length}B < ${Math.round(floor)}B)`,
-          );
-        } else {
-          if (sizes.length >= 60) sizes.shift();
-          sizes.push(screenshotBuffer.length);
-        }
+        screenshotBuffer = await judgeSmallDrawElementFrame(
+          session,
+          frameIndex,
+          screenshotBuffer,
+          () => redrawDrawElementFrame(session, frameIndex, time, seekOptions, heldVideoTime),
+        );
       }
     } catch (err) {
       // Missing paint records/canvas state require a new screenshot page.

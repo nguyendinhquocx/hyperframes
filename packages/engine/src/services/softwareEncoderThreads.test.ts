@@ -14,7 +14,7 @@ vi.mock("node:os", async (importOriginal) => ({
 
 import { buildEncoderArgs } from "./chunkEncoder.js";
 import type { EncoderOptions } from "./chunkEncoder.types.js";
-import { appendSoftwareEncoderThreadsArg } from "./softwareEncoderThreads.js";
+import { appendSoftwareEncoderThreadsArg, X265_MAX_THREADS } from "./softwareEncoderThreads.js";
 import { buildStreamingArgs } from "./streamingEncoder.js";
 
 const FFMPEG = getFfmpegBinary();
@@ -42,9 +42,20 @@ const threadsOf = (args: string[]) => args[args.indexOf("-threads") + 1];
 describe("software encoder thread count", () => {
   it("takes the CPU quota and floors at one", () => {
     const args: string[] = [];
-    appendSoftwareEncoderThreadsArg(args, 6.9);
-    appendSoftwareEncoderThreadsArg(args, 0);
+    appendSoftwareEncoderThreadsArg(args, "libx264", 6.9);
+    appendSoftwareEncoderThreadsArg(args, "libx264", 0);
     expect(args).toEqual(["-threads", "6", "-threads", "1"]);
+  });
+
+  it("caps libx265 at 16 threads and leaves libx264 uncapped", () => {
+    const x265: string[] = [];
+    const x264: string[] = [];
+    appendSoftwareEncoderThreadsArg(x265, "libx265", 64);
+    appendSoftwareEncoderThreadsArg(x264, "libx264", 64);
+    expect([x265, x264]).toEqual([
+      ["-threads", "16"],
+      ["-threads", "64"],
+    ]);
   });
 
   it.each(["h264", "h265"] as const)(
@@ -65,6 +76,28 @@ describe("software encoder thread count", () => {
   );
 });
 
+describe.skipIf(!HAS_FFMPEG)("libx265 thread limit", () => {
+  const encode = (threads: number) =>
+    spawnSync(FFMPEG, [
+      ...QUIET,
+      ...SOURCE,
+      "-frames:v",
+      "4",
+      "-c:v",
+      "libx265",
+      "-threads",
+      String(threads),
+      "-f",
+      "null",
+      "-",
+    ]).status;
+
+  it("rejects 17 threads and accepts the cap", () => {
+    expect(encode(X265_MAX_THREADS + 1)).not.toBe(0);
+    expect(encode(X265_MAX_THREADS)).toBe(0);
+  }, 60_000);
+});
+
 describe.skipIf(!HAS_TASKSET || !HAS_FFMPEG)("encoded bytes across host sizes", () => {
   const dirs: string[] = [];
   afterEach(() => {
@@ -72,7 +105,7 @@ describe.skipIf(!HAS_TASKSET || !HAS_FFMPEG)("encoded bytes across host sizes", 
   });
 
   /** Encode with the production args as a host with `cpus` cores would run them. */
-  function videoMd5(codec: "h264" | "h265", cpus: string): string {
+  function videoMd5(codec: "h264", cpus: string): string {
     const dir = mkdtempSync(join(tmpdir(), "hf-threads-"));
     dirs.push(dir);
     const out = join(dir, "out.mp4");
@@ -88,11 +121,8 @@ describe.skipIf(!HAS_TASKSET || !HAS_FFMPEG)("encoded bytes across host sizes", 
     return md5.stdout.trim();
   }
 
-  it.each(["h264", "h265"] as const)(
-    "gives %s identical bytes on a 2-core and a 7-core host",
-    (codec) => {
-      expect(videoMd5(codec, "0-1")).toBe(videoMd5(codec, "0-6"));
-    },
-    120_000,
-  );
+  // x265 output varies between runs even on one host, so only x264 can be held to identical bytes.
+  it("gives h264 identical bytes on a 2-core and a 7-core host", () => {
+    expect(videoMd5("h264", "0-1")).toBe(videoMd5("h264", "0-6"));
+  }, 120_000);
 });

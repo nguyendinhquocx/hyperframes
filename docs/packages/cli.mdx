@@ -113,7 +113,7 @@ npx hyperframes init my-video --tailwind
 | `--keep-original`   | Copy the `--video` file as is instead of converting a non-web codec to H.264 MP4                                                                                                                                                                                                     |
 | `--model`           | Whisper model for that transcription (for example `small.en`, `medium.en`, `large`)                                                                                                                                                                                                   |
 | `--language`        | Language code for transcription (`en`, `es`, `ja`, …). Filters out speech in other languages.                                                                                                                                                                                         |
-| `--skip-skills`     | Currently ignored. Set `HYPERFRAMES_SKIP_SKILLS=1` to opt out in CI or tests.                                                                                                                                                                                                         |
+| `--skip-skills`     | Leave AI coding skills alone: `init` does not install the core set. `HYPERFRAMES_SKIP_SKILLS=1` does the same.
 
 Pass `--video` or `--audio` and the CLI transcribes the audio with Whisper and
 patches the captions into the composition for you. `--skip-transcribe` turns
@@ -149,6 +149,10 @@ npx hyperframes add shader-wipe --no-clipboard --json   # headless / CI
 The positional name is a registry item, or a tag — a tag installs every block
 carrying it. `--dir` picks the project directory, `--json` prints the written
 files and paste snippet, and `--no-clipboard` skips the clipboard copy for CI.
+
+If any block in a tag fails to install, `add` keeps the successful installs and
+exits with code 1. With `--json`, `ok` is `false` and `errors` lists each failed
+block's `name` and `error`; `installed` lists the blocks that succeeded.
 
 Every install produces files plus a **paste snippet**: the `<iframe>` tag for a
 block, or the fragment path for a component. It goes to your clipboard by
@@ -306,7 +310,7 @@ npx hyperframes transcribe video.mp4 --to vtt
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--dir, -d`       | Project directory (default: current directory)                                                                                                                                                     |
 | `--engine, -e`    | ASR engine: `auto` (default — Parakeet if installed and the language is one of its 25, else whisper), `parakeet` (fails if Parakeet is missing, broken, or lacks the `--language`), or `whisper`. Under `auto` or `parakeet`, a `--language` other than English runs whisper when it is installed, with a note, because Parakeet detects the language itself |
-| `--model, -m`     | Whisper model (default `small.en`): `tiny.en`, `base.en`, `small.en`, `medium.en`, `large-v3`                                                                                                       |
+| `--model, -m`     | Whisper model (default `small.en`): `tiny.en`, `base.en`, `small.en`, `medium.en`, `small`, `medium`, `large-v3`                                                                                                       |
 | `--language, -l`  | Language code (`en`, `es`, `ja`, …). Whisper transcribes as this language; Parakeet detects the language itself, so it only takes a non-English `--language` when whisper is not installed. |
 | `--to`            | Write an `srt` or `vtt` sidecar: from a transcript file it exports instead of importing; from audio or video it is written beside `transcript.json`, with cues for languages without spaces grouped, which exporting that `transcript.json` later may split differently |
 | `--output, -o`    | Where the exported SRT/VTT goes                                                                                                                                                                    |
@@ -945,7 +949,8 @@ npx hyperframes open --json     # for agents
 When it runs under Claude Code, Codex, or Grok, the app's chat picks up that
 conversation. When it cannot open the app, for example because the app is not
 installed, `open` exits 1 and prints a download link. With `--json`, the result
-names the `reason` and the `downloadUrl`.
+names the `reason` and the `downloadUrl`. The hand-off works on macOS only for
+now: on Windows and Linux, `open` always exits 1 with the download link.
 
 `catch-up` is the other half of that hand-off. Run it when the person is back
 from the desktop app, before you change anything: it lists what they asked and
@@ -1352,7 +1357,7 @@ use is refused before anything is written.
 
 | Flag          | Applies to                                                     | Description                                                   |
 | ------------- | -------------------------------------------------------------- | ------------------------------------------------------------- |
-| `--plan`      | `move`, `trim`, `split`, `delete`, `set`, `duplicate`, `apply` | Print the result and the diff without writing                 |
+| `--plan`      | `move`, `trim`, `split`, `delete`, `set`, `duplicate`, `apply` | Print the result and the diff without writing. `apply --plan` prints only a count (`planned 1 file`); add `--json` for the result and diff. |
 | `--overwrite` | `move`, `trim`                                                 | Allow the clip to overlap a neighbour on its track            |
 | `--snap`      | `move`, `trim`, `split`, `delete`, `duplicate`                 | Round times to whole frames. Needs `data-fps` on the project. |
 | `--at`        | `duplicate`                                                    | Where the copy starts                                         |
@@ -1386,7 +1391,7 @@ npx hyperframes history undo --who claude            # undo your newest turn
 | Command                 | What it does                                                                                           |
 | ----------------------- | ------------------------------------------------------------------------------------------------------ |
 | `show <ref> [--diff]`   | One entry's files, before and after. `--diff` prints a text diff (needs `git`).                        |
-| `undo [ref]`            | Undo an entry, or with `--who <name>` and no ref, that name's newest turn still in effect              |
+| `undo [ref]`            | Undo an entry, or with `--who <name>` and no ref, whatever is still in effect from that name's last turn (its newest entry if it never used `begin`). If nothing from that turn is still in effect, it refuses rather than undoing an older turn. |
 | `restore <ref> [--who]` | Make the files what they were right after an entry, a time, or `start`                                 |
 | `peek <ref> [path]`     | List the files at an entry, a time, or `start` without changing anything; with a path, print that file |
 | `pin <ref> [--off]`     | Keep an entry, and what it needs, when old history is trimmed. `--off` unpins it.                      |
@@ -1434,7 +1439,7 @@ The flags that come up most:
 
 | Flag                | Default                       | Description                                                                                                                                       |
 | ------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--output, -o`      | `renders/<name>.mp4`          | Output file path                                                                                                                                  |
+| `--output, -o`      | `renders/<project>_<YYYY-MM-DD>_<HH-MM-SS>.<ext>` | Output file path                                                                                                                                  |
 | `--composition, -c` | `index.html`                  | Render a different composition file. Sub-compositions using `<template>` wrappers must be referenced from `index.html` via `data-composition-src`. |
 | `--format`          | `mp4`                         | `mp4`, `webm`, `mov`, `gif`, `png-sequence`, or `hls`. WebM and MOV carry transparency; `png-sequence` writes RGBA frames to a directory; `hls` writes a VOD playlist directory. |
 | `--fps, -f`         | root `data-fps`, otherwise 30 | 1–240, or an ffmpeg rational like `30000/1001` for 29.97                                                                                            |
@@ -1861,9 +1866,10 @@ npx hyperframes skills update slideshow
 Bare `skills` installs everything. `skills update` keeps a deliberate partial
 installation partial: it refreshes the core set plus whatever is already
 installed, and never expands beyond that unless you name a skill. Naming one
-adds it. `check` and `update` both accept `--json`, plus `--dir` and `--source`
-to point removed-detection at a different skills directory or source — those two
-scope the prune, not the install.
+adds it. `check` and `update` both accept `--json`, and `check` also accepts
+`--dir` and `--source`. `update` never removes a skill, and it leaves a skill the
+install record attributes to another publisher alone, even when the name matches
+one of ours.
 
 Set `HYPERFRAMES_SKIP_SKILLS=1` when something else manages the skills (CI, tests,
 or an install pinned to one commit). `skills update` and bare `skills` then exit 0
@@ -1871,7 +1877,7 @@ with a one-line notice and leave the installed skills unchanged.
 
 The CLI installs from the current HyperFrames GitHub source and links the global
 bundles into whichever compatible agents it finds. After scaffolding, `init`
-also refreshes the core set plus any HyperFrames skills you already have.
+installs the core set if it is missing. It never refreshes or removes a skill you already have; run `skills update` for that.
 
 #### `fatal: active post-checkout hook found during git clone`
 

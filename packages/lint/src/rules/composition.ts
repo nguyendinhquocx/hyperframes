@@ -661,6 +661,8 @@ function variablesDeclarationFindings(
         code: "invalid_composition_variables_declaration",
         severity: "error",
         message: `data-composition-variables entry [${i}] must be an object with id, type, label, and default.`,
+        fixHint:
+          'Replace the entry with an object such as {"id":"title","type":"string","label":"Title","default":"Hello"}.',
         snippet: truncateSnippet(tag.raw),
       });
       continue;
@@ -676,6 +678,7 @@ function variablesDeclarationFindings(
         code: "invalid_composition_variables_declaration",
         severity: "error",
         message: `data-composition-variables entry [${i}] is missing or has invalid: ${missing.join(", ")}. Type must be one of string, number, color, boolean, enum, font, image.`,
+        fixHint: `Give entry [${i}] a string id and label, a supported type, and a default, e.g. {"id":"title","type":"string","label":"Title","default":"Hello"}.`,
         snippet: truncateSnippet(tag.raw),
       });
       continue;
@@ -686,17 +689,19 @@ function variablesDeclarationFindings(
         severity: "error",
         message: `data-composition-variables entry [${i}] has a default that does not match its type, or an enum without an options array.`,
         fixHint:
-          "Use number defaults for number variables, boolean defaults for boolean variables, and string defaults for other types. Enum variables also require an options array.",
+          "Use number defaults for number variables, boolean defaults for boolean variables, and string defaults for other types. Font/image also accept font {name, source} or image {url, alt?, fit?} objects. Enum variables also require an options array.",
         snippet: truncateSnippet(tag.raw),
       });
       continue;
     }
-    const id = String(e.id);
+    const id = e.id;
+    const mediaUrl =
+      e.type === "image" && typeof e.default !== "string" ? e.default.url : e.default;
     if (
       (e.type === "image" || varSrcIds.has(id)) &&
-      typeof e.default === "string" &&
-      e.default.length > 0 &&
-      !isSafeMediaUrl(e.default)
+      typeof mediaUrl === "string" &&
+      mediaUrl.length > 0 &&
+      !isSafeMediaUrl(mediaUrl)
     ) {
       findings.push({
         code: "unloadable_media_variable_default",

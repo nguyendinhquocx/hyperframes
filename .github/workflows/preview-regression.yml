@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      preview: ${{ steps.release.outputs.release_only == 'true' && 'false' || steps.filter.outputs.preview }}
+      preview: ${{ steps.filter.outputs.preview }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:

@@ -66,8 +66,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     outputs:
-      release_only: ${{ steps.release.outputs.release_only }}
-      code: ${{ (github.event_name == 'workflow_dispatch' && inputs.catalog_publish) && 'true' || steps.release.outputs.release_only == 'true' && 'false' || steps.filter.outputs.code }}
+      code: ${{ (github.event_name == 'workflow_dispatch' && inputs.catalog_publish) && 'true' || steps.filter.outputs.code }}
       docs_catalog: ${{ steps.filter.outputs.docs_catalog }}
       cli: ${{ steps.filter.outputs.cli }}
       skills: ${{ steps.filter.outputs.skills }}
@@ -199,20 +198,6 @@ jobs:
               - "package.json"
               - "bun.lock"
               - ".github/workflows/ci.yml"
-
-  # A release PR changes versions and notes only (scripts/ci/release-only-diff.mjs), so heavy suites skip it.
-  # Build still packs the manifests and keeps the tarballs; this job checks the release is consistent.
-  release-checks:
-    name: Release checks
-    needs: changes
-    if: ${{ needs.changes.outputs.release_only == 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 4
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-      - run: node scripts/ci/release-only-diff.mjs --verify
 
   gcp-beginframe-contract:
     name: GCP BeginFrame image contract

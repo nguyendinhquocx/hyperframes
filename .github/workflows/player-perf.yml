@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     outputs:
-      perf: ${{ steps.filter.outputs.perf }}
+      perf: ${{ steps.release.outputs.release_only == 'true' && 'false' || steps.filter.outputs.perf }}
     steps:
       # Force git-based change detection instead of the pull_request REST API.
       # The API path can fail the perf workflow on transient listFiles timeouts.

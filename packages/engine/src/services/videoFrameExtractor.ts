@@ -8,7 +8,7 @@
 
 import { audioGroupsById, isMemberGroupHidden, isSelfOrAncestorHidden } from "./mediaHidden.js";
 import { copyFileSync, existsSync, linkSync, mkdirSync, rmSync } from "fs";
-import { join } from "path";
+import { basename, join } from "path";
 import { cpus } from "os";
 import { createConcurrencyLimit } from "../utils/concurrencyLimit.js";
 import { parseHTML } from "linkedom";
@@ -44,6 +44,7 @@ import { isKnownInactiveTimelineWindow } from "./mediaTimelineWindow.js";
 import {
   extractFinalVideoFrameTimestamp,
   extractMediaMetadata,
+  keyframeGapSeconds,
   mediaFileIdentity,
   readMetadataCache,
   readStoredFinalFrame,
@@ -421,6 +422,8 @@ export interface VideoExtractionFailure {
    * can contain a local path or a signed source URL.
    */
   error: string;
+  /** ffmpeg's last stderr lines, without paths or URLs: what a producer-facing error may say. */
+  ffmpegReason?: string;
 }
 
 export type VideoExtractionFailureStatusClass =
@@ -496,10 +499,30 @@ export class VideoSourceExtractionError extends Error {
     readonly retryable: boolean,
     message: string,
     readonly diagnostic: string = message,
+    readonly ffmpegReason?: string,
   ) {
     super(message);
     this.name = "VideoSourceExtractionError";
   }
+}
+
+const FFMPEG_REASON_LINES = 3;
+const FFMPEG_REASON_CHARS = 300;
+
+/** ffmpeg's last stderr lines for an error that leaves this host: no local path, file name or URL. */
+function ffmpegReasonFrom(stderr: string, paths: readonly string[]): string {
+  let text = stderr;
+  for (const known of paths.filter(Boolean).sort((a, b) => b.length - a.length))
+    text = text.split(known).join("<path>");
+  return text
+    .replace(/[a-z][a-z\d+.-]*:\/\/[^\s'"]+/gi, "<url>")
+    .replace(/(?:[a-z]:)?(?:[\\/][^\s\\/:'"]+){2,}/gi, "<path>")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(-FFMPEG_REASON_LINES)
+    .join(" | ")
+    .slice(-FFMPEG_REASON_CHARS);
 }
 
 export function isVideoSourceExtractionError(error: unknown): error is VideoSourceExtractionError {
@@ -921,6 +944,24 @@ export function sdrCanvasColourFilters(metadata: VideoMetadata, toneMappedToSdr 
  * frames are byte-identical to it.
  */
 const EXTRACTION_SEGMENT_SECONDS = 120;
+/** Slowest decode rate the stall clock allows while ffmpeg discards frames from a keyframe up to the seek point. */
+const SKIP_DECODE_FPS_FLOOR = 30;
+async function leadInSecondsUnlessAborted(
+  videoPath: string,
+  seek: number,
+  signal?: AbortSignal,
+): Promise<number> {
+  try {
+    return await keyframeGapSeconds(videoPath, seek, signal);
+  } catch (error) {
+    // Aborted: let runFfmpeg report the abort, so a segment stopped by another's failure reads as stopped.
+    if (signal?.aborted) return 0;
+    throw error;
+  }
+}
+function stallTimeoutMs(baseMs: number, skippedSeconds: number, sourceFps: number): number {
+  return baseMs + Math.ceil((skippedSeconds * sourceFps * 1000) / SKIP_DECODE_FPS_FLOOR);
+}
 /** Frame times since file start are `PTS*TB + seek`; snapping them to `lead + k/FR` gives every process one grid. */
 function undoTickRoundingOnTheSourceFrameGrid(seek: number, lead: number): string[] {
   const sinceFileStart = `(PTS*TB+${seek}-${lead})`;
@@ -942,6 +983,7 @@ interface SegmentedExtraction {
   videoPath: string;
   startTime: number;
   fps: number;
+  sourceFps: number;
   segments: readonly FrameRange[];
   gate: typeof inExtractionSlot;
   runOptions: { signal?: AbortSignal; timeout: number };
@@ -962,7 +1004,8 @@ function splitFrameRanges(ranges: readonly FrameRange[], segmentFrames: number):
 }
 
 async function runSegmentedExtraction(job: SegmentedExtraction): Promise<RunFfmpegResult> {
-  const { decodeArgs, filterAndEncodeArgs, videoPath, startTime, fps, segments, gate } = job;
+  const { decodeArgs, filterAndEncodeArgs, videoPath, startTime, fps, sourceFps, segments, gate } =
+    job;
   const segmentCount = segments.length;
   // One failed segment fails the range, so stop the others instead of finishing them.
   const failed = new AbortController();
@@ -977,7 +1020,7 @@ async function runSegmentedExtraction(job: SegmentedExtraction): Promise<RunFfmp
       const { firstFrame, frames } = segments[index]!;
       const seek = startTime + firstFrame / fps;
       const result = await gate(
-        () =>
+        async () =>
           runFfmpeg(
             [
               ...decodeArgs,
@@ -995,7 +1038,15 @@ async function runSegmentedExtraction(job: SegmentedExtraction): Promise<RunFfmp
               String(firstFrame + 1),
               ...filterAndEncodeArgs(seek),
             ],
-            { ...job.runOptions, signal },
+            {
+              ...job.runOptions,
+              signal,
+              timeout: stallTimeoutMs(
+                job.runOptions.timeout,
+                await leadInSecondsUnlessAborted(videoPath, seek, signal),
+                sourceFps,
+              ),
+            },
           ),
         signal,
       );
@@ -1004,7 +1055,10 @@ async function runSegmentedExtraction(job: SegmentedExtraction): Promise<RunFfmp
     }
   };
   const workers = Math.min(segmentCount, EXTRACTION_SLOTS);
-  await Promise.all(Array.from({ length: workers }, worker));
+  await Promise.all(Array.from({ length: workers }, worker)).catch((error) => {
+    failed.abort();
+    throw error;
+  });
   const ran = results.filter(Boolean);
   // Report the segment that failed, not the ones stopped because of it.
   const failure =
@@ -1100,9 +1154,6 @@ async function extractVideoFramesRangeUnredacted(
   }
 
   const args: string[] = urlInputArgs(videoPath);
-  if (decodeWithVideoToolbox) {
-    args.push("-hwaccel", "videotoolbox");
-  }
   // Always force the alpha-aware decoder on codecs that can carry alpha. The
   // alternative — gating on `metadata.hasAlpha` — relies on tag detection that
   // has at least three known failure modes: case-sensitivity across ffmpeg
@@ -1184,14 +1235,15 @@ async function extractVideoFramesRangeUnredacted(
   // emits that last slot: the fps filter ends a `-t` window at the nearest slot. A
   // decimal rate counts zero frames here and keeps the `-t` window.
   const boundVfrFrameCount = metadata.isVFR && totalFrames > 0;
-  const processResult =
+  const extract = (hwaccel: string[]) =>
     sampleAtOutputFps && (options.frameRanges || boundVfrFrameCount || totalFrames > segmentFrames)
-      ? await runSegmentedExtraction({
-          decodeArgs,
+      ? runSegmentedExtraction({
+          decodeArgs: [...hwaccel, ...decodeArgs],
           filterAndEncodeArgs: (seek) => [...filterArgsFor(seek), ...encodeArgs],
           videoPath,
           startTime,
           fps,
+          sourceFps: metadata.fps,
           gate: options.tailProbe ? inTailProbeSlot : inExtractionSlot,
           segments: splitFrameRanges(
             options.frameRanges ?? [{ firstFrame: 0, frames: totalFrames }],
@@ -1199,10 +1251,27 @@ async function extractVideoFramesRangeUnredacted(
           ),
           runOptions,
         })
-      : await inExtractionSlot(
-          () => runFfmpeg([...args, ...filterArgsFor(startTime), ...encodeArgs], runOptions),
+      : inExtractionSlot(
+          async () =>
+            runFfmpeg([...hwaccel, ...args, ...filterArgsFor(startTime), ...encodeArgs], {
+              ...runOptions,
+              timeout: stallTimeoutMs(
+                ffmpegProcessTimeout,
+                options.finalFrameOnly
+                  ? startTime
+                  : await leadInSecondsUnlessAborted(videoPath, startTime, signal),
+                metadata.fps,
+              ),
+            }),
           signal,
         );
+  let processResult = await extract(decodeWithVideoToolbox ? ["-hwaccel", "videotoolbox"] : []);
+  const ffmpegExitedFailing =
+    processResult.terminationReason === "exit" &&
+    !processResult.success &&
+    !processResult.failureReason;
+  const videoToolboxWasOptional = decodeWithVideoToolbox && !keepsHdrForChrome;
+  if (ffmpegExitedFailing && videoToolboxWasOptional) processResult = await extract([]);
   if (processResult.failureReason === "external_interruption") {
     throw new VideoSourceExtractionError(
       "external_interruption",
@@ -1230,12 +1299,18 @@ async function extractVideoFramesRangeUnredacted(
     const diagnostic =
       `${hdrPrefix}FFmpeg exited with code ${processResult.exitCode}${timeoutSuffix}: ` +
       processResult.stderr.slice(-500);
+    const ffmpegReason = ffmpegReasonFrom(processResult.stderr, [
+      videoPath,
+      basename(videoPath),
+      videoOutputDir,
+    ]);
     if (timedOut) {
       throw new VideoSourceExtractionError(
         "ffmpeg_timeout",
         true,
         "Video frame extraction timed out",
         diagnostic,
+        ffmpegReason,
       );
     }
     const transientIo =
@@ -1249,6 +1324,7 @@ async function extractVideoFramesRangeUnredacted(
         ? "Video frame extraction hit a transient I/O failure"
         : "Video source could not be decoded",
       diagnostic,
+      ffmpegReason,
     );
   }
 
@@ -1952,13 +2028,9 @@ export async function extractAllVideoFrames(
       }
       resolvedVideos.push({ video, videoPath });
     } catch (err) {
-      const classified = classifyVideoExtractionError(err);
       errors.push({
-        videoId: video.id,
-        kind: classified.kind,
-        retryable: classified.retryable,
+        ...extractionError(video.id, err),
         ...(err instanceof UrlDownloadError ? { group: downloadFailureGroup(video.src, err) } : {}),
-        error: classified.diagnostic,
       });
     }
   }
@@ -2069,7 +2141,7 @@ export async function extractAllVideoFrames(
   // Phase 3 still calls `extractVideoFramesRange` on the same past-EOF
   // mediaStart, surfacing a second raw FFmpeg error for the same clip.
   const hdrSkippedIndices = new Set<number>();
-  if (hdrInfo.hasHdr && hdrInfo.dominantTransfer) {
+  if (!options.toneMapHdrToSdr && hdrInfo.hasHdr && hdrInfo.dominantTransfer) {
     // dominantTransfer is "majority wins" — if a composition mixes PQ and HLG
     // sources (rare but legal), the minority transfer's videos get converted
     // with the wrong curve. We treat this as caller-error: a single composition
@@ -2161,6 +2233,7 @@ export async function extractAllVideoFrames(
       kind: classified.kind,
       retryable: classified.retryable,
       error: classified.diagnostic,
+      ...(classified.ffmpegReason ? { ffmpegReason: classified.ffmpegReason } : {}),
     };
   }
 
@@ -2628,12 +2701,7 @@ export async function extractAllVideoFrames(
         ? `[shared extraction, leader ${outcome.error.videoId}] ${outcome.error.error}`
         : outcome.error.error;
       results.push({
-        error: {
-          videoId: prepared.work.video.id,
-          kind: outcome.error.kind,
-          retryable: outcome.error.retryable,
-          error: message,
-        },
+        error: { ...outcome.error, videoId: prepared.work.video.id, error: message },
       });
       continue;
     }

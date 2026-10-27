@@ -3,6 +3,7 @@ import { setPreviewRasterScale } from "./previewRasterHints";
 import { createFarSceneSkip } from "./farScenes";
 import {
   clipLengthsWritten,
+  ownWindow,
   hostOf as sceneHostOf,
   isParked,
   parkedClips,
@@ -90,7 +91,7 @@ import {
   resolveNaturalMediaTimelineDuration,
   resolveRuntimeMediaClipDuration,
   syncRuntimeMedia,
-  VIDEO_PRESEEK_SECONDS,
+  MEDIA_PRESEEK_SECONDS,
   type RuntimeMediaClip,
 } from "./media";
 import {
@@ -3493,14 +3494,14 @@ export function initSandboxRuntimeModular(): void {
       visiting.add(clip.el);
     }
     if (state.isPlaying && !window.__HF_EXPORT_RENDER_SEEK_CONFIG) {
-      // An endpoint-only pass reaches trimmed video too late: its first visible tick starts a seek.
+      // An endpoint-only pass reaches a trimmed clip too late: its first active tick starts a seek.
       for (const clip of clipsWithEndpointBetween(
         index.byStart,
         (c) => c.start,
         toSeconds,
-        toSeconds + VIDEO_PRESEEK_SECONDS * state.playbackRate,
+        toSeconds + MEDIA_PRESEEK_SECONDS * state.playbackRate,
       )) {
-        if (clip.el.tagName === "VIDEO") visiting.add(clip.el);
+        visiting.add(clip.el);
       }
     }
     return [...visiting];
@@ -3653,12 +3654,17 @@ export function initSandboxRuntimeModular(): void {
         userVolume: state.bridgeVolume,
         forceSync,
         cueAheadSeconds,
+        clockAdvancing:
+          clock.getSource() !== "audio" ||
+          lastSyncedMediaTimeSeconds === null ||
+          state.currentTime > lastSyncedMediaTimeSeconds,
         getCompositionDuration: () =>
           getSafeTimelineDurationSeconds(state.capturedTimeline, 0, timingRevision),
         onElementVolume: (el, _effectiveVolume, authorVolume, clipGain, unfadedVolume) =>
           webAudio.setElementVolume(el, authorVolume, clipGain, unfadedVolume),
         isWebAudioOwned: (el) => webAudio.ownsElement(el),
         isWebAudioRouted: (el) => webAudio.routesElement(el),
+        seekUnderDip: (el, target) => webAudio.seekUnderDip(el, target),
         onAutoplayBlocked: () => {
           if (state.mediaAutoplayBlockedPosted) return;
           state.mediaAutoplayBlockedPosted = true;
@@ -4283,6 +4289,8 @@ export function initSandboxRuntimeModular(): void {
       if (refusal !== null) throw new Error(`scene ${name} cannot be swapped: ${refusal}`);
       if (!clipLengthsWritten(host))
         throw new Error(`scene ${name} cannot be swapped: a clip's length is not written`);
+      if (!ownWindow(host))
+        throw new Error(`scene ${name} cannot be swapped: its start or length is not in seconds`);
       const oldStyles = styles(partsOf(document, name));
       if (oldStyles.length !== styles(parts).length)
         throw new Error(`scene ${name} cannot be swapped: its styles moved`);
@@ -4303,6 +4311,7 @@ export function initSandboxRuntimeModular(): void {
       document
         .querySelector(`meta[name="${SCENE_PARTS_META}"]`)
         ?.setAttribute("content", JSON.stringify(nextParts));
+      windowScenes = windowedScenes();
       postTimeline();
       return;
     }
@@ -5502,6 +5511,18 @@ export function initSandboxRuntimeModular(): void {
     return longest;
   };
 
+  const STARVED_AUDIO_HOLD_MS = 3000;
+  let starvedAudio: { el: HTMLMediaElement; sinceMs: number } | null = null;
+
+  const audioMayDrivePlayhead = (el: HTMLMediaElement): boolean => {
+    if (el.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
+      starvedAudio = null;
+      return true;
+    }
+    if (starvedAudio?.el !== el) starvedAudio = { el, sinceMs: performance.now() };
+    return performance.now() - starvedAudio.sinceMs < STARVED_AUDIO_HOLD_MS;
+  };
+
   function refreshTransportClockSource(): void {
     // Audio-master clock: three tiers of timing precision.
     // 1. WebAudio (AudioContext.currentTime) while it plays a decoded buffer: ~21µs, sample-accurate
@@ -5520,7 +5541,9 @@ export function initSandboxRuntimeModular(): void {
         }
       } else {
         const source = followedOrLongestRunningAudio(clock.audioElement());
-        if (source && !source.el.paused) {
+        if (source && !audioMayDrivePlayhead(source.el)) {
+          if (clock.hasAudioSource()) clock.detachAudioSource();
+        } else if (source && !source.el.paused) {
           clock.attachAudioSource({
             el: source.el,
             compositionStart: source.start,
@@ -5535,8 +5558,9 @@ export function initSandboxRuntimeModular(): void {
           clock.detachAudioSource();
         }
       }
-    } else if (clock.hasAudioSource()) {
-      clock.detachAudioSource();
+    } else {
+      starvedAudio = null;
+      if (clock.hasAudioSource()) clock.detachAudioSource();
     }
   }
 

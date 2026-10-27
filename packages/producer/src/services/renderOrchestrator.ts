@@ -77,6 +77,7 @@ import {
   type BeforeCaptureHook,
   createVideoFrameInjector,
   getEncoderPreset,
+  type ProresProfile,
   distributeFrames,
   distributeFramesInterleaved,
   executeParallelCapture,
@@ -128,11 +129,11 @@ import {
   outputUsesH264Pipeline,
   type RenderOutputFormat,
 } from "./render/renderFormat.js";
+import { resolveHlsSegmentSeconds, validateHlsRenderConfig } from "./render/hlsConfig.js";
 import {
-  resolveHlsEncoderGopLock,
-  resolveHlsSegmentSeconds,
-  validateHlsRenderConfig,
-} from "./render/hlsConfig.js";
+  resolveDeliveryEncoderOptions,
+  validateDeliveryEncoderConfig,
+} from "./render/deliveryEncoder.js";
 import { createMemorySampler, type MemorySampler, updateJobStatus } from "./render/shared.js";
 import { frameCacheOptions } from "./render/frameCacheBudget.js";
 import { buildRenderErrorDetails } from "./render/cleanup.js";
@@ -415,6 +416,14 @@ export interface RenderConfig {
   crf?: number;
   /** Target video bitrate (e.g. "10M"). Mutually exclusive with `crf`. */
   videoBitrate?: string;
+  /** Keyframe every N seconds (mp4). A maximum where chunks join, as on Lambda. */
+  keyframeIntervalSeconds?: number;
+  /** MOV only: ProRes profile. Default `4444` keeps alpha; the 422 profiles drop it. */
+  proresProfile?: ProresProfile;
+  /** Peak bitrate cap (e.g. "8M", mp4) alongside CRF. */
+  maxBitrate?: string;
+  /** Rate-cap buffer; defaults to twice `maxBitrate`. */
+  bufferSize?: string;
   /**
    * Source-video frame extraction format. Defaults to `"auto"`, which preserves
    * the historical behavior: alpha/alpha-capable sources extract as PNG, all
@@ -1253,6 +1262,7 @@ export async function executeDiskCaptureWithAdaptiveRetry(options: {
   /** Mutated in place: the workers' page-error console lines, for the render's error count. */
   pageErrorLines?: string[];
   openAttempt?: OpenStallAttempt;
+  verifyFirstSession?: (session: CaptureSession) => Promise<void>;
 }): Promise<CaptureAttemptSummary[]> {
   const attempts: CaptureAttemptSummary[] = [];
   let currentWorkers = options.initialWorkerCount;
@@ -1331,6 +1341,7 @@ export async function executeDiskCaptureWithAdaptiveRetry(options: {
               : undefined,
             undefined,
             options.cfg,
+            { verifyFirstSession: options.verifyFirstSession },
           );
           pushWorkerDedupPerfs(workerResults, options.dedupPerfs);
           if (options.pageErrorLines) pushWorkerPageErrors(workerResults, options.pageErrorLines);
@@ -2901,6 +2912,7 @@ export async function executeRenderJob(
   // Ahead of the work dir / log file / execution context: a config the format
   // cannot honor must fail before anything is written to disk.
   validateHlsRenderConfig(job.config);
+  validateDeliveryEncoderConfig(job.config);
   const debugDir = resolveRenderDebugDir();
   const outputDir = dirname(outputPath);
   if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
@@ -2996,15 +3008,18 @@ async function executeRenderPipeline(input: {
   const isGif = outputFormat === "gif";
   const isHls = outputFormat === "hls";
   // Segment length and the matching GOP, resolved once. Both encoder paths
-  // spread the same `hlsEncoderGopLock`, so they cannot disagree — a GOP that
+  // spread the same `deliveryEncoder`, so they cannot disagree — a GOP that
   // is not exactly `segmentSeconds × fps` frames silently produces
   // variable-length segments instead of failing.
   const hlsSegmentSeconds = isHls ? resolveHlsSegmentSeconds(job.config) : undefined;
-  const hlsEncoderGopLock = resolveHlsEncoderGopLock(
-    outputFormat,
-    job.config.fps,
-    job.config.hlsSegmentSeconds,
-  );
+  const deliveryEncoder = resolveDeliveryEncoderOptions({
+    format: outputFormat,
+    fps: job.config.fps,
+    hlsSegmentSeconds: job.config.hlsSegmentSeconds,
+    keyframeIntervalSeconds: job.config.keyframeIntervalSeconds,
+    maxBitrate: job.config.maxBitrate,
+    bufferSize: job.config.bufferSize,
+  });
   const artifactTransaction = new ArtifactTransaction(
     outputPath,
     isPngSequence || isHls ? "directory" : "file",
@@ -4524,7 +4539,12 @@ async function executeRenderPipeline(input: {
     // are never written to ffmpeg in the png-sequence path.
     const presetFormat: "mp4" | "webm" | "mov" =
       outputFormat === "webm" || outputFormat === "mov" ? outputFormat : "mp4";
-    const preset = getEncoderPreset(job.config.quality, presetFormat, encoderHdr);
+    const preset = getEncoderPreset(
+      job.config.quality,
+      presetFormat,
+      encoderHdr,
+      job.config.proresProfile,
+    );
 
     // CLI overrides (--crf, --video-bitrate) flow through job.config and must
     // win over the preset-derived defaults. The CLI enforces mutual exclusivity
@@ -4591,6 +4611,7 @@ async function executeRenderPipeline(input: {
             preset,
             effectiveQuality,
             effectiveBitrate,
+            deliveryEncoder,
             fileServer: activeFileServer,
             buildCaptureOptions,
             createRenderVideoFrameInjector,
@@ -4636,6 +4657,9 @@ async function executeRenderPipeline(input: {
           preset: preset.preset,
           quality: effectiveQuality,
           bitrate: effectiveBitrate,
+          maxBitrate: deliveryEncoder.maxBitrate,
+          bufferSize: deliveryEncoder.bufferSize,
+          gopSize: deliveryEncoder.gopSize,
           pixelFormat: preset.pixelFormat,
           imageFormat: segmentImageFormat,
           useGpu: job.config.useGpu === true,
@@ -4710,8 +4734,8 @@ async function executeRenderPipeline(input: {
                   useGpu: job.config.useGpu,
                   imageFormat: segmentImageFormat,
                   hdr: preset.hdr,
-                  // No hlsEncoderGopLock here: each segment sets its own GOP to
-                  // its own length, and hls never reaches this route.
+                  // Each segment sets its own GOP (at most the interval); hls never reaches this route.
+                  ...deliveryEncoder,
                 },
                 buildCaptureOptions,
                 createRenderVideoFrameInjector,
@@ -4883,7 +4907,7 @@ async function executeRenderPipeline(input: {
                   // assemble stage's `-c copy` segmentation cuts exactly on
                   // the segment boundary. Every other format leaves the
                   // encoder's open-GOP output untouched.
-                  ...hlsEncoderGopLock,
+                  ...deliveryEncoder,
                 },
                 buildCaptureOptions,
                 createRenderVideoFrameInjector,
@@ -5127,7 +5151,7 @@ async function executeRenderPipeline(input: {
           engineConfig: cfg,
           // Same value the streaming encoder above spreads — the disk and
           // chunked-concat encoders need an identical GOP lock for HLS.
-          ...hlsEncoderGopLock,
+          ...deliveryEncoder,
           abortSignal: executionSignal,
           assertNotAborted,
           onProgress,

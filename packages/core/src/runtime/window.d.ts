@@ -9,6 +9,7 @@ import type { RuntimeColorGradingApi } from "./colorGrading";
 import type { HyperframePickerApi } from "../inline-scripts/pickerApi";
 import type { PlayerAPI } from "../core.types";
 import type { ClipTree } from "./clipTree";
+import type { CompositionLengthSource } from "./compositionLength";
 import type { SvgSelectorAliases } from "../compiler/svgSelectorAliases";
 
 type ThreeClockLike = {
@@ -59,6 +60,8 @@ declare global {
       onSwallowed?: (label: string, err: unknown) => void;
       seek?: (timeSeconds: number, options?: RuntimeSeekOptions) => void;
       duration?: number;
+      /** Which input set the length; the producer reports it with the render. */
+      lengthSource?: CompositionLengthSource;
       /** How a length that no timeline supplied was found: the render telemetry reads this. */
       durationSource?: {
         source: "authored" | "derived" | "unresolved";
@@ -99,7 +102,7 @@ declare global {
     __hfSceneAnimations?: Record<string, SceneAnimation[]> | null;
     /** Swap edited scenes from a rebuilt preview document; refuses before changing anything when it cannot. */
     __hfSwapScenes?: (html: string, signal?: AbortSignal) => Promise<void>;
-    __hfHoldScenes?: (names: string[]) => Promise<void>;
+    __hfHoldScenes?: (names: string[], holder?: string) => Promise<void>;
     __hfParkedSceneMarkup?: (placeholder: Element) => Element | null;
     __HF_EXPORT_RENDER_SEEK_CONFIG?: {
       mode?: string;

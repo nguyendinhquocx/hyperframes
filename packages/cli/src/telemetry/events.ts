@@ -674,6 +674,7 @@ export function trackRenderError(
     errorName?: string;
     /** failedStage normalized to a stable snake_case code. */
     failedStageCode?: string;
+    missingPathKind?: string;
     errorMessage?: string;
     elapsedMs?: number;
     peakMemoryMb?: number;
@@ -702,6 +703,7 @@ export function trackRenderError(
       failed_stage: props.failedStage,
       error_name: props.errorName,
       failed_stage_code: props.failedStageCode,
+      missing_path_kind: props.missingPathKind,
       error_message: props.errorMessage ? redactTelemetryMessage(props.errorMessage) : undefined,
       elapsed_ms: props.elapsedMs,
       ...renderOutputShapeEventProperties(props),
@@ -872,11 +874,15 @@ export function trackAuthLoginFailed(
 // install's anonymousId, so events recorded before sign-in stitch to the same
 // person instead of stranding as a separate anonymous profile. Routed through
 // trackEvent so it shares the opt-out gate and flush path — a no-op when
-// telemetry is disabled. `distinctId` is the account email (else username);
-// see the privacy notice in showTelemetryNotice and docs/packages/cli.mdx.
-export function identifyUser(distinctId: string): void {
+// telemetry is disabled. Identity comes from auth/telemetryIdentity.ts; see
+// showTelemetryNotice and docs/packages/cli.mdx.
+export function identifyUser(distinctId: string, traits: Record<string, string> = {}): void {
   if (!distinctId) return;
-  trackEvent("$identify", { $anon_distinct_id: readConfig().anonymousId }, distinctId);
+  trackEvent(
+    "$identify",
+    { $anon_distinct_id: readConfig().anonymousId, $set: traits },
+    distinctId,
+  );
 }
 
 // A render was rejected by the output-resolution/HDR pre-flight (P1-3)

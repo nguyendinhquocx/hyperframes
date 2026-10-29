@@ -84,6 +84,7 @@ import {
   MEDIA_SYNC_TOLERANCE_SECONDS,
   isUnplayable,
   mediaSourceTimeAt,
+  primeMediaForLaterStarts,
   readElementPlaybackRate,
   readElementPlaybackStart,
   readElementRateSpec,
@@ -550,6 +551,8 @@ export function initSandboxRuntimeModular(): void {
   ensureColorGroupInertStyle(document);
   const exportRenderFps = resolveExportRenderFps();
   state.canonicalFps = exportRenderFps.fps ?? compositionFps() ?? state.canonicalFps;
+  const renderFps =
+    exportRenderFps.fps ?? (window.__HF_REPLAY_SKIPPED_FRAMES ? state.canonicalFps : undefined);
   setRuntimeProtocolFps(state.canonicalFps);
   if (window.__HF_EXPORT_RENDER_SEEK_CONFIG) {
     const fpsDetail = JSON.stringify({
@@ -4577,6 +4580,7 @@ export function initSandboxRuntimeModular(): void {
     const wantedNow = (name: string) =>
       heldScenes.has(name) ||
       scenesWanted(windowScenes, state.currentTime, clock.isPlaying()).has(name);
+    const parkedBeforeStep = parkedNames.size;
     windowWork = (async () => {
       if (landed) await mountScene(landed.name);
       else if (toMount) {
@@ -4586,7 +4590,8 @@ export function initSandboxRuntimeModular(): void {
       } else for (const { name } of toRetire) retireScene(name);
     })().finally(() => {
       windowWork = null;
-      windowNear = "";
+      const stuckStepKeepsItsPlan = parkedNames.size === parkedBeforeStep;
+      windowNear = stuckStepKeepsItsPlan ? key : "";
       moveSceneWindow(state.currentTime);
     });
     // A seek is not done until the scene it lands in is mounted.
@@ -4720,6 +4725,7 @@ export function initSandboxRuntimeModular(): void {
       }
       runAdapters("play");
       syncMediaForCurrentState();
+      primeMediaForLaterStarts(resolveMediaClipIndex().clips.map((clip) => clip.el));
       colorGrading.redraw();
       postState(true);
     },
@@ -5084,7 +5090,7 @@ export function initSandboxRuntimeModular(): void {
       const suppressEvents = options?.suppressEvents === true;
       // Guarded: a partial timeline without pause() must still get its seek.
       pauseTimelineIfPossible(timeline);
-      seekGsapTimeline(timeline, timeSeconds, suppressEvents, gsapStructureOf(timeline));
+      seekGsapTimeline(timeline, timeSeconds, suppressEvents, gsapStructureOf(timeline), renderFps);
     } catch (err) {
       // The scene's own callback threw. A warning, not a script error: it must not turn a
       // timed-out timeline wait into a script failure.
@@ -5315,7 +5321,7 @@ export function initSandboxRuntimeModular(): void {
       try {
         if (typeof tl.totalTime === "function") {
           const structure = gsapStructureOf(tl);
-          const redrawn = seekGsapTimeline(tl, tlSeekTime, suppressEvents, structure);
+          const redrawn = seekGsapTimeline(tl, tlSeekTime, suppressEvents, structure, renderFps);
           if (!redrawn && !suppressEvents && !hasZeroDurationCallbackTween(tl, structure)) {
             // The first seek is the only eventful one; the re-render only refreshes styles.
             rerenderGsapTimelineAt(

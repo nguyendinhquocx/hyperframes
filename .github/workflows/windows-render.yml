@@ -415,17 +415,8 @@ jobs:
             studio_shard: 2/2
           - lane: core
             packages: --filter @hyperframes/core --filter @hyperframes/player --filter @hyperframes/shader-transitions
-          # Engine and CLI ran one after the other in a single lane (about 5 + 11 min), 16 min of a 16 min deadline;
-          # each half runs the same two packages with Vitest's --shard, so the lanes end together.
-          - lane: engine-cli-1
+          - lane: engine-cli
             packages: --filter @hyperframes/engine --filter @hyperframes/cli
-            test_shard: 1/2
-            process_tests: true
-          - lane: engine-cli-2
-            packages: --filter @hyperframes/engine --filter @hyperframes/cli
-            test_shard: 2/2
-            process_tests: true
-            once_checks: true
             runtime_contract: true
 
     steps:
@@ -438,8 +429,8 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ inputs.ref || github.sha }}
-          # Only the engine-cli lanes read an LFS file (engine's ffprobe test parses a producer HDR PNG).
-          lfs: ${{ matrix.process_tests == true }}
+          # Only the engine-cli lane reads an LFS file (engine's ffprobe test parses a producer HDR PNG).
+          lfs: ${{ matrix.lane == 'engine-cli' }}
 
       # -----------------------------------------------------------------
       # Install FFmpeg so vitest suites that gate on `HAS_FFMPEG`
@@ -499,22 +490,22 @@ jobs:
         run: bun run ${{ matrix.packages }} test -- --maxWorkers=2
 
       - name: Verify waveform cache writes on Windows
-        if: matrix.once_checks
+        if: matrix.lane == 'engine-cli'
         shell: pwsh
         run: bun run --cwd packages/studio-server test -- src/helpers/waveform.test.ts src/helpers/waveform.file-race.test.ts --maxWorkers=2
 
       - name: Verify producer lint entry reads on Windows
-        if: matrix.once_checks
+        if: matrix.lane == 'engine-cli'
         shell: pwsh
         run: bunx vitest run packages/producer/src/services/hyperframeLint.file-race.test.ts --maxWorkers=2
 
       - name: Verify Windows frame staging
-        if: matrix.once_checks
+        if: matrix.lane == 'engine-cli'
         shell: pwsh
         run: bunx vitest run packages/producer/src/services/windowsFrameStaging.test.ts --maxWorkers=2
 
       - name: Verify catalog file operations on Windows
-        if: matrix.once_checks
+        if: matrix.lane == 'engine-cli'
         shell: pwsh
         run: bunx vitest run scripts/catalog/catalog-payload-assets.file-race.test.ts scripts/catalog/catalog-payload-assets.cache-race.test.ts --maxWorkers=2
 

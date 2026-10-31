@@ -54,6 +54,7 @@ import { injectCompositionCssVariables } from "./getVariables";
 import { createCssAdapter } from "./adapters/css";
 import {
   createGsapAdapter,
+  holdFrameMarks,
   rerenderGsapTimelineAt,
   seekGsapTimeline,
   type GsapStructureKey,
@@ -3989,6 +3990,19 @@ export function initSandboxRuntimeModular(): void {
       seek: (t, suppressEvents) => {
         seekRootChildrenAndAdapters(state.capturedTimeline, t, { suppressEvents });
       },
+      // Silent pose reads re-arm GSAP's landing marks (a step at t would fire again), and a render
+      // seek, which has no structure, lands back on t without same-time steps' authored order.
+      holdFrame: () => {
+        const land = holdFrameMarks({
+          scenes: sceneTimelines().map(([, timeline]) => timeline),
+          root: state.capturedTimeline,
+          structureOf: gsapStructureOf,
+        });
+        return (t) =>
+          land(() =>
+            seekRootChildrenAndAdapters(state.capturedTimeline, t, { suppressEvents: true }),
+          );
+      },
       ignoreMutations: withoutOwnCompositionRecords,
     });
   }
@@ -4573,7 +4587,11 @@ export function initSandboxRuntimeModular(): void {
       ({ name, start, end }) => start <= time && time <= end && parked(name),
     );
     if (windowWork) {
-      if (landed) registerSeekCompletion(windowWork.then(() => windowWork));
+      if (landed)
+        registerSeekCompletion(
+          windowWork.then(() => windowWork),
+          "scene-window",
+        );
       return landed !== undefined;
     }
     const near = scenesWanted(windowScenes, time, clock.isPlaying());
@@ -4610,7 +4628,7 @@ export function initSandboxRuntimeModular(): void {
       moveSceneWindow(state.currentTime);
     });
     // A seek is not done until the scene it lands in is mounted.
-    if (landed) registerSeekCompletion(windowWork);
+    if (landed) registerSeekCompletion(windowWork, "scene-window");
     return landed !== undefined;
   };
   // Mounts the named scenes and keeps them mounted until the same holder's next call names others.
@@ -4708,7 +4726,7 @@ export function initSandboxRuntimeModular(): void {
     colorGrading.redraw();
     paintVfx(state.currentTime);
     const blurred = paintCaptureMotionBlur(state.currentTime);
-    if (blurred) registerSeekCompletion(blurred);
+    if (blurred) registerSeekCompletion(blurred, "motion-blur");
     postState(true);
   };
 
@@ -4801,7 +4819,7 @@ export function initSandboxRuntimeModular(): void {
         window.clearTimeout(capTimer);
         if (heldSeek === held) flushHeldSeek();
       });
-      registerSeekCompletion(landed);
+      registerSeekCompletion(landed, "image-decode");
       return landed;
     },
     renderSeek: (timeSeconds, options) => {
@@ -4827,7 +4845,7 @@ export function initSandboxRuntimeModular(): void {
       colorGrading.redraw();
       paintVfx(state.currentTime, { engineMode: true });
       const blurred = paintCaptureMotionBlur(state.currentTime, { engineMode: true });
-      if (blurred) registerSeekCompletion(blurred);
+      if (blurred) registerSeekCompletion(blurred, "motion-blur");
       postState(true);
     },
     getTime: () => heldSeek?.time ?? clock.now(),

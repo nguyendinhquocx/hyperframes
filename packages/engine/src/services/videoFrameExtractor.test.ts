@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import {
   parseVideoElements,
+  hasGradedCanvas,
   parseImageElements,
   extractAllVideoFrames,
   extractVideoFramesRange,
@@ -23,6 +24,7 @@ import {
   createFrameLookupTable,
   FrameLookupTable,
   rebaseVideoToWindow,
+  alignClipStartToFirstOutputFrame,
   resolveFrameFormat,
   codecMayHaveAlpha,
   decoderForCodec,
@@ -190,6 +192,14 @@ describe("resolveVideoExtractionDuration", () => {
     // composition second 2 is 3s into the authored lane: source 4.6586
     const seconds = clip.mediaStart + sourceTimeAt(clip.playbackRate ?? 1, 2 - clip.start);
     expect(seconds).toBeCloseTo(4.6586, 3);
+  });
+
+  it("leaves media start untouched for a nested clip whose start sums to a frame boundary with float dust", () => {
+    // 3.3 + 1.3666666666666667 = 4.666666666666666, frame 140 at 30 fps
+    const clip = video({ start: 3.3 + 1.3666666666666667, end: 8, mediaStart: 1.35 });
+    alignClipStartToFirstOutputFrame(clip, 30);
+    expect(clip.mediaStart).toBe(1.35);
+    expect(clip.start).toBe(140 / 30);
   });
 
   it("snaps a float-noise composition start to the timeline origin so the first frame is kept", () => {
@@ -738,6 +748,25 @@ describe("resolveFrameFormat", () => {
 });
 
 describe("parseVideoElements", () => {
+  it("marks a graded video and image, and only those", () => {
+    const html = `<video id="g" src="g.mp4" data-color-grading='{"preset":"clean-studio"}'></video>
+      <video id="p" src="p.mp4"></video>
+      <img id="gi" src="gi.png" data-color-grading='{"adjust":{"exposure":0.2}}'>
+      <img id="pi" src="pi.png">`;
+    expect(parseVideoElements(html).map(({ id, graded }) => [id, graded])).toEqual([
+      ["g", true],
+      ["p", undefined],
+    ]);
+    expect(parseImageElements(html).map(({ id, graded }) => [id, graded])).toEqual([
+      ["gi", true],
+      ["pi", undefined],
+    ]);
+    expect(hasGradedCanvas(html)).toBe(false);
+    expect(
+      hasGradedCanvas(`<canvas data-color-grading='{"preset":"clean-studio"}'></canvas>`),
+    ).toBe(true);
+  });
+
   it.each([
     {
       label: "valueless playback-start",

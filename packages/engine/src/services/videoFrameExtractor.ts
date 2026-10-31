@@ -12,6 +12,7 @@ import { basename, join } from "path";
 import { cpus } from "os";
 import { createConcurrencyLimit } from "../utils/concurrencyLimit.js";
 import { parseHTML } from "linkedom";
+import { HF_COLOR_GRADING_ATTR } from "@hyperframes/core";
 import { isPathInside } from "@hyperframes/parsers/asset-paths";
 import { resolveProjectRelativeSrc } from "@hyperframes/parsers/asset-resolution";
 import { alphaDecoderFor } from "@hyperframes/parsers/media-alpha";
@@ -45,6 +46,7 @@ import {
   extractFinalVideoFrameTimestamp,
   extractMediaMetadata,
   ffmpegSeekSeconds,
+  formatFfmpegSeconds,
   keyframeGapSeconds,
   mediaFileIdentity,
   readMetadataCache,
@@ -104,6 +106,7 @@ export interface VideoElement {
   loop: boolean;
   hasAudio: boolean;
   hidden?: boolean;
+  graded?: boolean;
 }
 
 export interface ExtractedFrames {
@@ -844,6 +847,7 @@ export function parseVideoElements(html: string): VideoElement[] {
       (isAudibleVideoElement(el) && isMemberGroupHidden(groupsById, el))
         ? { hidden: true }
         : {}),
+      ...(el.hasAttribute(HF_COLOR_GRADING_ATTR) ? { graded: true } : {}),
     });
   }
 
@@ -855,6 +859,14 @@ export interface ImageElement {
   src: string;
   start: number;
   end: number;
+  graded?: boolean;
+}
+
+export function hasGradedCanvas(html: string): boolean {
+  return (
+    parseHTML(unwrapTemplate(html)).document.querySelector(`canvas[${HF_COLOR_GRADING_ATTR}]`) !==
+    null
+  );
 }
 
 export function parseImageElements(html: string): ImageElement[] {
@@ -894,7 +906,13 @@ export function parseImageElements(html: string): ImageElement[] {
       end = Infinity;
     }
 
-    images.push({ id, src, start, end });
+    images.push({
+      id,
+      src,
+      start,
+      end,
+      ...(el.hasAttribute(HF_COLOR_GRADING_ATTR) ? { graded: true } : {}),
+    });
   }
 
   return images;
@@ -1042,12 +1060,12 @@ async function runSegmentedExtraction(job: SegmentedExtraction): Promise<RunFfmp
               ...decodeArgs,
               "-noaccurate_seek",
               "-ss",
-              String(job.ffmpegSeek(seek)),
+              formatFfmpegSeconds(job.ffmpegSeek(seek)),
               "-i",
               videoPath,
               // Read one frame past the segment and keep exactly its own frames.
               "-t",
-              String((frames + 1) / fps),
+              formatFfmpegSeconds((frames + 1) / fps),
               "-frames:v",
               String(frames),
               "-start_number",
@@ -1190,11 +1208,25 @@ async function extractVideoFramesRangeUnredacted(
     // sample. This is intentionally reserved for the one-frame path: input
     // seeking is faster, but valid unindexed transports (notably MPEG-TS with
     // a negative timestamp base) can seek to EOF and emit zero frames.
-    args.push("-i", videoPath, "-ss", String(Math.max(0, ffmpegSeek(startTime))), "-frames:v", "1");
+    args.push(
+      "-i",
+      videoPath,
+      "-ss",
+      formatFfmpegSeconds(Math.max(0, ffmpegSeek(startTime))),
+      "-frames:v",
+      "1",
+    );
   } else {
     // An accurate seek drops the frame on screen at startTime; the fps sampling below needs it.
     if (sampleAtOutputFps) args.push("-noaccurate_seek");
-    args.push("-ss", String(ffmpegSeek(startTime)), "-i", videoPath, "-t", String(duration));
+    args.push(
+      "-ss",
+      formatFfmpegSeconds(ffmpegSeek(startTime)),
+      "-i",
+      videoPath,
+      "-t",
+      formatFfmpegSeconds(duration),
+    );
   }
 
   const vfFilters: string[] = [];
@@ -1493,13 +1525,17 @@ export function isVideoPastTimelineEnd(video: Pick<VideoElement, "start">, timel
   return video.start >= timelineEnd;
 }
 
-function alignClipStartToFirstOutputFrame(video: VideoElement, fps: number): void {
+export function alignClipStartToFirstOutputFrame(video: VideoElement, fps: number): void {
   if (video.loop || !Number.isFinite(video.start) || video.start < 0 || !(fps > 0)) return;
   const position = exportClipWindow(video.start, Infinity, fps).start * fps;
   const firstFrame =
     Math.abs(position - Math.round(position)) < 1e-6 ? Math.round(position) : Math.ceil(position);
   const shift = firstFrame / fps - video.start;
-  if (shift === 0) return;
+  // Float dust (a sum landing a hair off the grid) snaps the start; it never reaches mediaStart.
+  if (Math.abs(shift) < 1e-9) {
+    video.start = firstFrame / fps;
+    return;
+  }
   const playbackRate = normalizeRateSpec(video.playbackRate);
   video.mediaStart += sourceTimeAt(playbackRate, shift);
   video.playbackRate = shiftRateLane(playbackRate, shift);

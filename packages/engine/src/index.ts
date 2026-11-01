@@ -267,7 +267,10 @@ export {
   isVideoFrameFormat,
   EXTRACT_CACHE_MIN_AGE_MS,
   sdrCanvasColourFilters,
+  buildVideoLayerInput,
+  type VideoLayerInput,
 } from "./services/videoFrameExtractor.js";
+export { qualifyVideoLayer } from "./services/videoLayerPassthrough.js";
 export { isSelfOrAncestorHidden } from "./services/mediaHidden.js";
 export { directorySizeBytes, gcExtractionCache } from "./services/extractionCache.js";
 
@@ -402,6 +405,7 @@ export {
   type RunFfmpegResult,
 } from "./utils/runFfmpeg.js";
 export { aacSegmentCount, encodeAac } from "./services/aacEncode.js";
+export { applyAudioFxChain } from "./services/audioFxRender.js";
 export {
   ManagedChildProcess,
   type ManagedChildProcessOptions,

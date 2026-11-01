@@ -31,7 +31,7 @@ import { copiesReady } from "./previewCopies";
 import { installRuntimeControlBridge, postRuntimeMessage, setRuntimeProtocolFps } from "./bridge";
 import { instantTolerance } from "../clipFacts";
 import { isInClipWindow } from "./clipWindow";
-import { mediaElementTime } from "./mediaClock";
+import { isWebKit, mediaElementTime } from "./mediaClock";
 import {
   CLIP_HIDDEN_ATTR,
   revealTimedClipsAfterFirstPass,
@@ -158,7 +158,7 @@ import {
   forgetPositionEdit,
   installPositionEditsSeekReapply,
 } from "./positionEdits";
-import { unproxiedSrc } from "./proxySrc";
+import { stillStandsIn, unheldPoster, unproxiedSrc } from "./proxySrc";
 import { applyVariableBindings, unproxiedMediaSrc } from "./applyVariableBindings";
 import { createColorGradingRuntime, type RuntimeColorGradingApi } from "./colorGrading";
 import { COLOR_GRADING_AUTHORED_OPACITY_ATTR } from "../colorGrading";
@@ -385,9 +385,12 @@ const writtenShape = (el: Element): string =>
   JSON.stringify([
     Array.from(el.attributes, ({ name, value }) => [
       name,
-      name === "class" ? ownClasses(value) : value,
+      name === "class" ? ownClasses(value) : name === "poster" ? unheldPoster(el) : value,
     ])
-      .filter(([name, value]) => !RUNTIME_MEDIA_ATTRS.has(name!) && !(name === "class" && !value))
+      .filter(
+        ([name, value]) =>
+          !RUNTIME_MEDIA_ATTRS.has(name!) && !((name === "class" || name === "poster") && !value),
+      )
       .sort(([a], [b]) => (a! < b! ? -1 : 1)),
     el.hasAttribute("data-var-src") ? null : unproxiedSrc(el),
     el.innerHTML,
@@ -477,6 +480,19 @@ const joinsWebAudio = (el: Element): el is HTMLMediaElement =>
       masterChain: readMasterFxChain(el.ownerDocument),
     }));
 const WEB_AUDIO_MEDIA = "audio[data-start], video[data-start]";
+const DECODE_FIRST_MAX_SECONDS = 300;
+
+/** WebKit restarts a media element's audio 150 to 400 ms late; a decoded buffer on the context clock starts on time. */
+function decodesFirst(el: HTMLMediaElement): boolean {
+  return (
+    isWebKit() &&
+    isAudioElement(el) &&
+    !el.loop &&
+    el.duration <= DECODE_FIRST_MAX_SECONDS &&
+    typeof readElementRateSpec(el) === "number" &&
+    readElementPlaybackRate(el) === 1
+  );
+}
 const webAudioMediaIn = (root: ParentNode): HTMLMediaElement[] =>
   Array.from(root.querySelectorAll(WEB_AUDIO_MEDIA)).filter(joinsWebAudio);
 
@@ -3129,7 +3145,10 @@ export function initSandboxRuntimeModular(): void {
       if (el.preload !== "none") {
         el.preload = "none";
         // Frees a clip the window armed; on one the parser started, it would only restart the fetch.
-        if (decided) withoutOwnTimingRecords(el, () => releaseMedia(el));
+        if (decided)
+          withoutOwnTimingRecords(el, () =>
+            releaseMedia(el, window.__HF_RELEASE_PASSED_MEDIA === true),
+          );
       }
     } else if (!visible || decided === undefined) {
       // Not a clip a jump lands on: the media sync arms that one, and load() would undo its seek.
@@ -5627,7 +5646,7 @@ export function initSandboxRuntimeModular(): void {
       ) {
         const webAudioTime = webAudio.getTime();
         if (webAudioTime >= 0) {
-          clock.attachAudioSource({ currentTimeSeconds: webAudioTime });
+          clock.attachAudioSource({ currentTimeSeconds: webAudioTime, webAudio: true });
         }
       } else {
         const source = followedOrLongestRunningAudio(clock.audioElement());
@@ -5675,6 +5694,7 @@ export function initSandboxRuntimeModular(): void {
               isInClipWindow(t, start, end) &&
               !hasDataAhead(el) &&
               isPlayableTrack(el) &&
+              !stillStandsIn(el) &&
               !webAudio.ownsElement(el),
           )
           .map(({ el }) => el);
@@ -5782,6 +5802,7 @@ export function initSandboxRuntimeModular(): void {
             ({ el }) => el.tagName === "VIDEO" && !el.paused && el.readyState < 3,
           ),
           frozen: hasFrozenPicture(mediaClipsInWindow, t),
+          clock: clock.followedClock(),
           layoutKey: `${window.innerWidth}x${window.innerHeight}@${window.devicePixelRatio}`,
         });
       }
@@ -5972,6 +5993,25 @@ export function initSandboxRuntimeModular(): void {
           : Promise.resolve(null);
       void capture.then((scheduled) => {
         const replacedByNewerPass = gen !== webAudio.currentGeneration();
+        if (scheduled && state.playbackRate === 1 && decodesFirst(rawEl)) {
+          void webAudio.decodeAudioElement(rawEl).then(async (buffer) => {
+            if (!buffer || !clock.isPlaying() || gen !== webAudio.currentGeneration()) return;
+            const played = await webAudio.schedulePlayback(
+              rawEl,
+              buffer,
+              compStart,
+              mediaStart,
+              () => clock.now(),
+              vol,
+              gen,
+              state.playbackRate,
+              clipDuration,
+              kept.start,
+            );
+            if (played) webAudio.releaseRouted(rawEl);
+          });
+          return;
+        }
         // A video's picture must keep playing from the element, so it has no decode fallback.
         if (scheduled || !isAudioElement(rawEl) || !clock.isPlaying() || replacedByNewerPass)
           return;
@@ -6031,7 +6071,7 @@ export function initSandboxRuntimeModular(): void {
       !state.webAudioMediaDisabled &&
       webAudioReady &&
       clock.isPlaying() &&
-      webAudio.hasBoundedActiveSources()
+      (webAudio.hasBoundedActiveSources() || webAudio.hasHandedOverSources())
     ) {
       webAudio.stopAll();
       scheduleWebAudioForActiveClips();

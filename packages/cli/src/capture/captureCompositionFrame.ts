@@ -69,6 +69,7 @@ export interface SeekCompositionTimelineOptions {
   settleMs?: number;
   waitForImagesMs?: number;
   waitForVideoFrames?: boolean;
+  seekSettleTimeoutMs?: number;
   // Box-only reads: software GL spends about a second per frame on draws nothing here looks at.
   skipWebglDraws?: boolean;
 }
@@ -342,6 +343,7 @@ export async function openSettledCompositionPage(
     await installMediaRenderIdBridge(page);
     await page.evaluateOnNewDocument(forcePreservedDrawingBuffer);
     await page.evaluateOnNewDocument("window.__HF_REPLAY_SKIPPED_FRAMES = true");
+    await page.evaluateOnNewDocument("window.__HF_RELEASE_PASSED_MEDIA = true");
     await page.setViewport(viewport);
     if (answer) await answerPageInProcess(page, url, answer);
     await options.beforeNavigate?.(page);
@@ -564,7 +566,10 @@ export async function settleCompositionSeek(
     },
     {
       videoFrames: options.waitForVideoFrames !== false,
-      timeoutMs: SEEK_SETTLES_BEFORE_PROTOCOL_TIMEOUT_MS,
+      timeoutMs: Math.min(
+        options.seekSettleTimeoutMs ?? SEEK_SETTLES_BEFORE_PROTOCOL_TIMEOUT_MS,
+        SEEK_SETTLES_BEFORE_PROTOCOL_TIMEOUT_MS,
+      ),
     },
   );
 

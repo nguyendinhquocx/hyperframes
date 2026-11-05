@@ -60,6 +60,7 @@ import {
   VIEWPORT_META_SIZE_RE,
 } from "@hyperframes/parsers";
 import { decodableAudioStream } from "@hyperframes/parsers/media-streams";
+import { cliSourced } from "../utils/sourceTag.js";
 
 function resolveScaffoldTemplateId(exampleFlag: string | undefined, hasMediaFile: boolean): string {
   const example = exampleFlag === "agent" ? "blank" : exampleFlag;
@@ -690,7 +691,9 @@ async function keepSkillsCurrent(destDir: string): Promise<void> {
       // "up to date"; the engine already reported what it could verify or
       // blind-install. Point at the recovery command instead.
       console.log(
-        c.dim("Skills freshness unverified — run `npx hyperframes skills update` when online."),
+        c.dim(
+          "Skills freshness unverified (offline?). For the user: `npx hyperframes skills update` refreshes them once online.",
+        ),
       );
     } else if (result.installed.length === 0) {
       console.log(c.success("AI coding skills are already up to date."));
@@ -977,7 +980,7 @@ export default defineCommand({
       console.log();
       if (skipSkills) {
         console.log(
-          `  ${c.accent("1.")} Use your HyperFrames plugin, or install standalone skills:`,
+          `  ${c.accent("1.")} For the user: use your HyperFrames plugin, or install standalone skills with:`,
         );
         console.log(`     ${c.accent("npx hyperframes skills update")}`);
       } else {
@@ -995,7 +998,9 @@ export default defineCommand({
       console.log(
         `     ${c.dim('"Using /hyperframes, create a 15-second intro about [your topic]"')}`,
       );
-      console.log(`     ${c.dim("More patterns: hyperframes.heygen.com/prompting/overview")}`);
+      console.log(
+        `     ${c.dim(`More patterns: ${cliSourced("https://hyperframes.heygen.com/prompting/overview")}`)}`,
+      );
       console.log();
       console.log(`  ${c.accent("4.")} Preview in the browser:`);
       console.log(`     ${c.accent(`cd ${name}`)} && ${c.accent("npm run dev")}`);
@@ -1006,7 +1011,7 @@ export default defineCommand({
       console.log(`  ${c.accent("6.")} Render to MP4 when ready:`);
       console.log(`     ${c.accent(`cd ${name}`)} && ${c.accent("npm run render")}`);
       console.log();
-      console.log(`  ${c.dim("Full docs: hyperframes.heygen.com")}`);
+      console.log(`  ${c.dim(`Full docs: ${cliSourced("https://hyperframes.heygen.com")}`)}`);
       return;
     }
 

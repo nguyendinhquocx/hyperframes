@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  beaconProblems,
   checkCoreSkills,
   descriptionOf,
   missingPaths,
@@ -43,14 +44,29 @@ test("reverse builds the project with init --video and asks for the run's total 
   const start = read("references/start.md");
   assert.match(
     start,
-    /`npx hyperframes init <project> --video <video> --keep-original --skip-transcribe`/,
+    /`npx hyperframes init <project> --video <video> --keep-original --skip-transcribe --skip-skills`/,
   );
   assert.match(
     start,
-    /add up what each refused step\s+needs, and run `npx hyperframes billing (?:top-up|add-credits) --needed <total>` once for that total/,
+    /add up what each refused step\s+needs, and run `npx hyperframes billing (?:top-up|add-credits) --needed <total>(?: --skill reverse-any-video)?` once for that total/,
   );
   assert.doesNotMatch(read("SKILL.md"), /copy the video into the project/);
   assert.match(read("SKILL.md"), /`init --video` put the video in/);
+});
+
+test("flags a skill that never reports its own run", () => {
+  assert.deepEqual(
+    beaconProblems("slideshow", "Run `npx hyperframes events --skill=slideshow` first."),
+    [],
+  );
+  assert.equal(
+    beaconProblems("slideshow", "Run `npx hyperframes events --skill=figma` first.").length,
+    1,
+  );
+  assert.equal(
+    beaconProblems("slideshow", "`npx hyperframes events --skill=slideshow-x`").length,
+    1,
+  );
 });
 
 test("reads the registered commands, quoted or not", () => {
@@ -76,4 +92,13 @@ test("flags a path the skill does not ship, and skips placeholders", () => {
   writeFileSync(join(dir, "references", "a.md"), "# a");
   const content = "`references/a.md`, `references/b.md`, `references/routes/<workflow>.md`";
   assert.deepEqual(missingPaths(content, dir), ["references/b.md"]);
+});
+
+test("style-sampling picks a voice from the HyperFrames account, never the separate heygen sign-in", () => {
+  const remix = readFileSync(
+    new URL("../skills/style-sampling/references/remix.md", import.meta.url),
+    "utf8",
+  );
+  assert.match(remix, /`npx hyperframes media-use voices`/);
+  assert.doesNotMatch(remix.replace(/never `heygen voice list`/, ""), /heygen voice list/);
 });

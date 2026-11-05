@@ -770,12 +770,12 @@ it("fails the check on an audio error and reports it in its own section", async 
   expect(report.ok).toBe(false);
 });
 
-it("still checks audio when lint errors skip the browser pass", async () => {
+it("still checks audio when a lint error skips the browser pass", async () => {
   const { report, browser } = await runScenario(
     fakeDriver(),
     {},
     {
-      lint: lintWith("error", "missing_timeline_registry", "No timeline"),
+      lint: lintWith("error", "root_missing_composition_id", "Root needs data-composition-id."),
       inspectAudio: vi.fn(async () => [
         {
           code: "audio_none",
@@ -1568,7 +1568,7 @@ describe("check pipeline", () => {
     });
   });
 
-  it("short-circuits on lint errors without launching a browser, and flags the skipped sections", async () => {
+  it("short-circuits on a lint error that leaves nothing to load, and flags the skipped sections", async () => {
     const lint = lintWith(
       "error",
       "root_missing_composition_id",
@@ -1588,7 +1588,27 @@ describe("check pipeline", () => {
     expect(report.contrast).toMatchObject({ ok: true, errorCount: 0, findings: [] });
   });
 
-  it("says in plain words that a lint error is why the browser pass was skipped", async () => {
+  it("runs the browser checks past a lint error that still loads, and fails on the lint error", async () => {
+    const failingContrast = vi.fn(async (time: number) => ({
+      entries: time === 0.5 ? [contrastEntry()] : [],
+      pngBase64: PNG_BASE64,
+    }));
+    const lint = lintWith("error", "missing_timeline_registry", "No timeline registered.");
+    const { report, browser } = await runScenario(
+      fakeDriver({ collectContrast: failingContrast }),
+      {},
+      { lint },
+    );
+
+    expect(browser).toHaveBeenCalled();
+    expect(report.browserSkipped).toBe(false);
+    expect(report.lint.errorCount).toBe(1);
+    expect(report.contrast.errorCount).toBeGreaterThan(0);
+    expect(report.ok).toBe(false);
+    expect(checkExitCode(report)).toBe(1);
+  });
+
+  it("says in plain words that a lint error left no composition to load", async () => {
     const lint = lintWith(
       "error",
       "root_missing_composition_id",
@@ -1606,7 +1626,7 @@ describe("check pipeline", () => {
     await runViaCli(command, { rawArgs: [] });
 
     const said = log.mock.calls.map((call) => String(call[0])).join("\n");
-    expect(said).toContain("Browser validation skipped because of the lint error above");
+    expect(said).toContain("the lint error above leaves no composition to load");
     expect(said).not.toContain("Browser session never ran");
   });
 
@@ -1673,7 +1693,10 @@ describe("check pipeline", () => {
 
   it.each([
     { lint: cleanLint(), handed: true },
-    { lint: lintWith("error", "lint_error", "Lint error."), handed: false },
+    {
+      lint: lintWith("error", "root_missing_composition_id", "Root needs data-composition-id."),
+      handed: false,
+    },
   ])(
     "closes the browser started during lint unless the browser pass took it",
     async ({ lint, handed }) => {
@@ -2918,6 +2941,24 @@ describe("check pipeline", () => {
       expect(line?.seconds).toBeCloseTo(0.7, 1);
       const sampled = vi.mocked(driver.collectCraftFrame!).mock.calls.map(([time]) => time);
       expect(sampled.some((time) => Math.round(time * 1000) % 125 !== 0)).toBe(true);
+    });
+
+    it("thins the craft grid when frames are slow, so the pass stays near its budget and still reaches the end", async () => {
+      let clock = 0;
+      vi.spyOn(performance, "now").mockImplementation(() => clock);
+      const driver = craftDriver({
+        getDuration: vi.fn(async () => 60),
+        collectCraftFrame: vi.fn(async (time: number) => {
+          clock += 1000;
+          return craftFrame(time);
+        }),
+      });
+      const { report } = await runScenario(driver);
+
+      expect(report.craft.samples).toBeGreaterThan(20);
+      expect(report.craft.samples).toBeLessThan(120);
+      expect(report.craft.step).toBeGreaterThan(0.5);
+      expect(report.craft.step).toBeLessThanOrEqual(1.5);
     });
 
     it("samples a long film at 8 fps, finer than the overlap pass's capped grid", async () => {

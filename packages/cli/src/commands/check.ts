@@ -165,6 +165,11 @@ async function saveCheckReport(
 const CHECK_COMMAND_ARGS = {
   dir: { type: "positional", description: "Project directory", required: false },
   json: { type: "boolean", description: "Output agent-readable JSON", default: false },
+  "lint-verbose": {
+    type: "boolean",
+    description: "Accepted as render's spelling; check always prints every lint finding",
+    default: false,
+  },
   samples: {
     type: "string",
     description: "Number of midpoint samples across the duration (default: 9)",
@@ -209,6 +214,11 @@ const CHECK_COMMAND_ARGS = {
     type: "string",
     description: "Allowed pixel overflow before reporting an issue (default: 2)",
     default: "2",
+  },
+  budget: {
+    type: "string",
+    description:
+      "Stop the whole check this long after it starts (ms, or 90s, 8m; at least 30s) and report what it found so far",
   },
   timeout: {
     type: "string",
@@ -343,6 +353,13 @@ function reportCheckFailure(
 }
 
 const REPORT_GRACE_MS = 5_000;
+const MIN_BUDGET_MS = 30_000;
+const BUDGET_REPORT_MS = 10_000;
+
+function parseBudget(raw: unknown): CheckOptions["budget"] {
+  const ms = parseTimeoutMs(raw, 0, MIN_BUDGET_MS, console.error, "--budget");
+  return ms > 0 ? { ms, stopAt: Date.now() + ms - BUDGET_REPORT_MS } : undefined;
+}
 
 function untilReported(): { done: () => void } {
   let done = (): void => undefined;
@@ -418,6 +435,7 @@ function parseCheckOptions(args: Record<string, unknown>): CheckOptions {
     collapseStatic: args["collapse-static"] !== false,
     tolerance: nonNegativeNumber(args.tolerance, DEFAULT_CHECK_OPTIONS.tolerance),
     timeout: parseTimeoutMs(args.timeout, DEFAULT_CHECK_OPTIONS.timeout, 500),
+    budget: parseBudget(args.budget),
     contrast: args.contrast !== false,
     ...(checkReview()?.skipContrastInMotion ? { skipContrastInMotion: true } : {}),
     strict: args.strict === true,

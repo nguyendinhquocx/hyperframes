@@ -20,10 +20,14 @@ const disposeSignalHandlers = installRenderSetupSignalHandlers(
   process.env.HYPERFRAMES_RENDER_DETACHED !== "1",
 );
 
+const SANDBOX_REFUSED_PRIORITY = new Set(["EPERM", "EACCES"]);
+
 function lowerPriority(): void {
   try {
     setPriority(constants.priority.PRIORITY_LOW);
   } catch (error) {
+    if (SANDBOX_REFUSED_PRIORITY.has((error as { info?: { code?: string } }).info?.code ?? ""))
+      return;
     process.stderr.write(`Lint runs at normal priority: ${(error as Error).message}\n`);
   }
 }
@@ -32,8 +36,8 @@ async function runMode(): Promise<unknown> {
   if (mode === "browser") return ensureBrowser(input);
   if (mode === "browser-install") return runBrowserInstall(input);
   if (mode === "lint") {
-    // Nobody waits on a background lint the way they wait on a Studio boot, so it takes idle CPU only.
-    lowerPriority();
+    // A background lint (Studio's, preview's) takes idle CPU only; a render waits on its lint, so that one does not.
+    if (input.background) lowerPriority();
     return lintProject(
       input.projectDir,
       input.entryFile,

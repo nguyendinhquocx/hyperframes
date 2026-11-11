@@ -1036,10 +1036,21 @@ async function initDrawElementOrTransparentBackground(
   // help, and the safety-net blank guard also stands down under it so diagnostic
   // frames arrive unmodified.
   const forceDE = process.env.HF_FORCE_DRAWELEMENT === "1";
+  // drawElement verification and worker-encode are JPEG-only; its PNG path is for alpha.
+  const opaquePng = session.options.format === "png" && !capturesAlpha(session.options);
   const useDrawElement =
     ((session.config?.useDrawElement ?? false) || forceDE) &&
     !supersampling &&
+    !opaquePng &&
     (!forceScreenshot || forceDE);
+  if ((session.config?.useDrawElement ?? false) && !supersampling && opaquePng) {
+    session.deGateReason = "opaque_png";
+    session.deFallbackTrigger = "opaque_png";
+    console.error(
+      "[engine] fast capture disabled for this render: lossless opaque PNG capture " +
+        "uses the launch-mode capture path.",
+    );
+  }
   if ((session.config?.useDrawElement ?? false) && supersampling) {
     session.deGateReason = "supersampling";
     session.deFallbackTrigger = "supersampling";
@@ -1332,6 +1343,7 @@ function drawElementWorkerEncodeEligible(session: CaptureSession, transparent: b
   return (
     (session.config?.enableDrawElementWorkerEncode ?? false) &&
     !transparent &&
+    session.options.format !== "png" &&
     session.beginFrameTimeTicks === 0
   );
 }
@@ -2653,6 +2665,14 @@ export function recordSubTimelineWarning(session: CaptureSession, timeoutMs: num
   const loadCauses = session.scriptLoadCauses ?? [];
   const pending = session.pendingTimelineIds ?? [];
   const pendingSuffix = pending.length > 0 ? ` (still unregistered: ${pending.join(", ")})` : "";
+  // The render page's gsap reads null until GSAP's script runs, so a too-early gsap.timeline() surfaces as this.
+  const gsapNotLoaded = sources.some((s) =>
+    /gsap is not defined|Cannot read properties of (?:null|undefined) \(reading '(?:timeline|registerPlugin)'\)/.test(
+      s,
+    ),
+  )
+    ? " GSAP was not loaded yet when that script ran: load the GSAP script before the first script that uses gsap."
+    : "";
   const isolated = session.isolatedCompositions ?? [];
   if (isolated.length > 0) {
     recordCaptureWarnings(session, [
@@ -2676,7 +2696,7 @@ export function recordSubTimelineWarning(session: CaptureSession, timeoutMs: num
       code: scriptFailure ? "sub_timeline_script_failure" : "sub_timeline_readiness_timeout",
       message: threwThenTimedOut
         ? `A composition script threw before its timeline registered` +
-          `${pendingSuffix} (${sources.join(", ")}). Fix the error; a composition animated by ` +
+          `${pendingSuffix} (${sources.join(", ")}).${gsapNotLoaded} Fix the error; a composition animated by ` +
           `CSS or rAF rather than a GSAP timeline must mark its host with data-no-timeline.`
         : scriptFailure
           ? `A sub-composition timeline script failed to load${scriptLoadCauseSuffix(loadCauses)} ` +

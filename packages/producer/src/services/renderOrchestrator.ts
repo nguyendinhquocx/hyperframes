@@ -108,6 +108,7 @@ import {
   augmentProtocolTimeoutError,
   augmentPageNavigationTimeoutError,
   displaySize,
+  type ChromaSubsampling,
   type MotionBlurOptions,
   type PageMotionBlurSummary,
 } from "@hyperframes/engine";
@@ -140,6 +141,10 @@ import {
   validateDeliveryEncoderConfig,
 } from "./render/deliveryEncoder.js";
 import {
+  assertChromaSubsamplingSdr,
+  validateChromaSubsamplingConfig,
+} from "./render/chromaSubsampling.js";
+import {
   createMemorySampler,
   describeWorkerPhases,
   forgetWorkerPhases,
@@ -170,7 +175,7 @@ import {
 import { runCaptureSegmentedStage } from "./render/stages/captureSegmentedStage.js";
 import {
   RenderTooSlowError,
-  checkRenderEta,
+  checkCalibratedRenderEta,
   startRenderEtaGuard,
 } from "./render/renderEtaGuard.js";
 import { checkPageNeverReady } from "./render/pageNeverReady.js";
@@ -258,10 +263,7 @@ import {
 } from "./render/stages/encodeStage.js";
 import { recordLimiterAttenuation, runAssembleStage } from "./render/stages/assembleStage.js";
 import { shouldUseLayeredComposite } from "./hdrCompositor.js";
-import {
-  resolveCaptureImageFormat,
-  resolveCaptureJpegQuality,
-} from "./render/captureImageFormat.js";
+import { resolveCaptureSurface } from "./render/captureImageFormat.js";
 import { assertMotionBlurSupported, pageMotionBlurForRoute } from "./render/motionBlurRoute.js";
 import { assertOutputScaleSupported } from "./render/outputScaleRoute.js";
 
@@ -450,6 +452,8 @@ export interface RenderConfig {
   maxBitrate?: string;
   /** Rate-cap buffer; defaults to twice `maxBitrate`. */
   bufferSize?: string;
+  /** MP4 chroma, default `"420"`. `"444"` captures PNG and encodes yuv444p (SDR, software). */
+  chromaSubsampling?: ChromaSubsampling;
   /**
    * Source-video frame extraction format. Defaults to `"auto"`, which preserves
    * the historical behavior: alpha/alpha-capable sources extract as PNG, all
@@ -1219,19 +1223,30 @@ export function resetCaptureAttemptProgress(job: { framesRendered?: number }): v
 }
 
 const FIRST_FRAME_STALL_MS = 300_000;
+// Capture browsers start like the probe's did: allow twice its start-up before the first frame, up to the ceiling.
+const FIRST_FRAME_STARTUP_FACTOR = 2;
+const FIRST_FRAME_STALL_CEILING_MS = 900_000;
 const TAIL_STALL_MS = FIRST_FRAME_STALL_MS;
+
+/** Allowed wait for the first frame, given how long the probe's browser took to start; 0 or unknown keeps 300 s. */
+export function firstFrameWindowMs(probeStartupMs: number | undefined): number {
+  const fromStartup = (probeStartupMs ?? 0) * FIRST_FRAME_STARTUP_FACTOR;
+  if (!Number.isFinite(fromStartup)) return FIRST_FRAME_STALL_MS;
+  return Math.max(FIRST_FRAME_STALL_MS, Math.min(FIRST_FRAME_STALL_CEILING_MS, fromStartup));
+}
 
 /** The no-progress rule for capture stages that have no watchdog of their own: disk, HDR, chunk. Once
  * `totalFrames` have landed the frame count can no longer change, so the stage is judged on the tail budget. */
 export function frameStallRule(
   job: { framesRendered?: number },
   totalFrames: number,
+  probeStartupMs: number | undefined,
 ): StageStallRule {
   const noProgressMs = resolveCaptureStallTimeoutMs();
   return {
     progress: () => job.framesRendered ?? 0,
     noProgressMs,
-    firstProgressMs: Math.max(FIRST_FRAME_STALL_MS, noProgressMs),
+    firstProgressMs: Math.max(firstFrameWindowMs(probeStartupMs), noProgressMs),
     complete: () => (job.framesRendered ?? 0) >= totalFrames,
     tailMs: Math.max(TAIL_STALL_MS, noProgressMs),
     detail: () => describeWorkerPhases(job),
@@ -3025,6 +3040,7 @@ export async function executeRenderJob(
   // cannot honor must fail before anything is written to disk.
   validateHlsRenderConfig(job.config);
   validateDeliveryEncoderConfig(job.config);
+  validateChromaSubsamplingConfig(job.config);
   const debugDir = resolveRenderDebugDir();
   const outputDir = dirname(outputPath);
   if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
@@ -3758,19 +3774,30 @@ async function executeRenderPipeline(input: {
     });
     const videoCaptureBeyondViewport = resolveVideoCaptureBeyondViewport(composition.videos.length);
 
-    const captureImageFormat = resolveCaptureImageFormat({
-      needsAlpha,
-      motionBlur: job.config.motionBlur,
-    });
+    const captureSurface = resolveCaptureSurface(
+      {
+        needsAlpha,
+        motionBlur: job.config.motionBlur,
+        chromaSubsampling: job.config.chromaSubsampling,
+      },
+      job.config.quality,
+    );
+    if (job.config.chromaSubsampling === "444") {
+      log.info("[Render] Capture: png (chromaSubsampling 444, lossless)");
+    }
     const captureOptions: CaptureOptions = {
       width,
       height,
       fps: job.config.fps,
-      format: videoLayer ? "png" : captureImageFormat,
-      transparent: needsAlpha || videoLayer !== undefined,
-      ...(videoLayer ? { hiddenElementIds: [videoLayer.videoId] } : {}),
-      quality:
-        captureImageFormat === "png" ? undefined : resolveCaptureJpegQuality(job.config.quality),
+      ...captureSurface,
+      ...(videoLayer
+        ? {
+            format: "png",
+            quality: undefined,
+            transparent: true,
+            hiddenElementIds: [videoLayer.videoId],
+          }
+        : {}),
       variables: job.config.variables,
       deviceScaleFactor,
       motionBlur: job.config.motionBlur,
@@ -3912,6 +3939,7 @@ async function executeRenderPipeline(input: {
     // comps that route to the layered/HDR paths.)
     const nativeHdrIds = new Set([...nativeHdrVideoIds, ...nativeHdrImageIds]);
     const hasHdrContent = Boolean(effectiveHdr && nativeHdrIds.size > 0);
+    assertChromaSubsamplingSdr(job.config, hasHdrContent);
     if (hasHdrContent) assertOutputScaleSupported(deviceScaleFactor, "hdr_layered");
     routePageMotionBlur = pageMotionBlurForRoute({ hasHdrContent, useLayeredComposite: false });
     // DE priority inversion eligibility — evaluated BEFORE capture calibration
@@ -4257,6 +4285,7 @@ async function executeRenderPipeline(input: {
         forceScreenshot: captureForceScreenshot,
         multiplier: outcome.calibration?.estimate.multiplier ?? null,
         p95Ms: outcome.calibration?.estimate.p95Ms ?? null,
+        medianMs: outcome.calibration?.estimate.medianMs ?? null,
       });
     } else {
       observability.checkpoint("capture_calibration", "skipped", {
@@ -4393,12 +4422,12 @@ async function executeRenderPipeline(input: {
 
     // No calibration estimate (explicit workers, short or forced-screenshot renders) skips the
     // pre-capture check; the measured-rate guard below still covers capture.
-    const calibratedTooSlow = checkRenderEta("capture_calibration", {
+    const calibratedTooSlow = checkCalibratedRenderEta({
       maxRenderMs: job.config.maxRenderMs,
       elapsedMs: Date.now() - pipelineStart,
-      framesCompleted: 0,
       totalFrames,
-      msPerFrame: (captureCalibration?.estimate.p95Ms ?? 0) / workerCount,
+      estimate: captureCalibration?.estimate,
+      workerCount,
     });
     if (calibratedTooSlow) throw calibratedTooSlow;
     execution.defer(
@@ -4769,6 +4798,8 @@ async function executeRenderPipeline(input: {
       hasHdrContent: capturePlan.hasHdrContent,
       hasShaderTransitions: compiled.hasShaderTransitions,
       isPngSequence,
+      captureImageFormat: captureOptions.format ?? "jpeg",
+      chromaSubsampling: job.config.chromaSubsampling ?? "420",
     });
     const encoderHdr = hasHdrContent ? effectiveHdr : undefined;
     // png-sequence has no encoder, but the rest of the orchestrator still
@@ -4782,6 +4813,7 @@ async function executeRenderPipeline(input: {
       presetFormat,
       encoderHdr,
       job.config.proresProfile,
+      job.config.chromaSubsampling,
     );
 
     // CLI overrides (--crf, --video-bitrate) flow through job.config and must
@@ -4898,7 +4930,7 @@ async function executeRenderPipeline(input: {
             onProgress,
           });
         },
-        { stall: frameStallRule(job, totalFrames) },
+        { stall: frameStallRule(job, totalFrames, perfStages.browserProbeMs) },
       );
       lastBrowserConsole = hdrRes.lastBrowserConsole;
       layeredCaptureWarnings.push(...hdrRes.warnings);
@@ -5475,7 +5507,7 @@ async function executeRenderPipeline(input: {
                 interleaveFrames: overlap !== null,
                 openAttempt,
               }),
-            { stall: frameStallRule(job, totalFrames) },
+            { stall: frameStallRule(job, totalFrames, perfStages.browserProbeMs) },
           );
         let captureRes;
         try {

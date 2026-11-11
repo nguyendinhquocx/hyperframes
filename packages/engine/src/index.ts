@@ -216,6 +216,7 @@ export {
   HLS_MASTER_PLAYLIST,
   HLS_VIDEO_PLAYLIST,
   HLS_AUDIO_PLAYLIST,
+  type ChromaSubsampling,
   type GpuEncoder,
   type PackageHlsOptions,
 } from "./services/chunkEncoder.js";
@@ -398,6 +399,8 @@ export {
   type MediaProbeProfile,
   type KeyframeAnalysis,
 } from "./utils/ffprobe.js";
+
+export { mediaIdPathSegment } from "./utils/mediaPathSegment.js";
 
 export {
   NOT_MEDIA_PAYLOAD,

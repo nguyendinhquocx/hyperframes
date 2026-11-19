@@ -126,7 +126,6 @@ jobs:
               - "packages/cli/src/media-use/**"
               - "scripts/check-media-use-copy-parity.test.mjs"
               - "scripts/check-skill-import-boundaries.test.mjs"
-              - "scripts/check-skill-python-encoding.test.mjs"
               - "scripts/generate-skill-module-copies.mjs"
               - "skills/**"
               - ".claude/skills/**"
@@ -466,8 +465,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # core + engine take 8-10 min (2026-11-12); a 10 min limit cancelled runs as they finished.
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -574,7 +572,6 @@ jobs:
       - run: bun run --filter '@hyperframes/{parsers,lint,studio-server}' build
       - run: bun run --cwd packages/core build
       - run: bun run --filter @hyperframes/engine build
-      - run: bash scripts/ci/install-pinned-headless-shell.sh
       - run: bun run producer:test:${{ matrix.lane }}
 
   # Tests under skills/**/*.test.mjs are bare `node --test` files with only
@@ -613,7 +610,7 @@ jobs:
             echo "::error::No skills/**/*.test.mjs files found. Did the layout change?"
             exit 1
           fi
-          SKILLS_TESTS+=(scripts/check-media-use-copy-parity.test.mjs scripts/check-skill-python-encoding.test.mjs scripts/creator-editing-capabilities.test.mjs)
+          SKILLS_TESTS+=(scripts/check-media-use-copy-parity.test.mjs scripts/creator-editing-capabilities.test.mjs)
           printf 'Running %d skills test file(s):\n' "${#SKILLS_TESTS[@]}"
           printf '  * %s\n' "${SKILLS_TESTS[@]}"
           node --import ./packages/cli/scripts/test-home.mjs --test "${SKILLS_TESTS[@]}"
@@ -1205,7 +1202,7 @@ jobs:
 
           bun run --filter @hyperframes/cli dev -- lint /tmp/hf-cli-inside
           bun run --filter @hyperframes/cli dev -- validate /tmp/hf-cli-inside --timeout 3000
-          HF_DEBUG_RENDER=1 bun run --filter @hyperframes/cli dev -- render /tmp/hf-cli-inside \
+          bun run --filter @hyperframes/cli dev -- render /tmp/hf-cli-inside \
             --quality standard \
             --workers auto \
             --strict \

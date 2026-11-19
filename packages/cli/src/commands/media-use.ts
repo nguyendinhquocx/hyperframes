@@ -5,6 +5,16 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { finishCommand } from "../utils/commandResult.js";
 import { withMediaAuthEnvironment } from "../auth/media-environment.js";
+import {
+  PROJECT_ENV_ORIGINS,
+  PROJECT_ENV_YIELDED,
+  projectEnvOrigins,
+  projectEnvYielded,
+} from "../utils/dotEnv.js";
+import {
+  skipWorkingDirectoryInExeSearch,
+  withOnlyTrustedPathFolders,
+} from "../utils/windowsExeSearch.js";
 
 const MEDIA_USE_ARGS = {
   type: { type: "string", description: "What to find: bgm, sfx, image, icon, logo, voice" },
@@ -78,9 +88,16 @@ export function mediaUseVerbFlags(verb: MediaUseVerb): string[] {
 export function mediaUseEngineEnv(
   env: NodeJS.ProcessEnv,
   entry: string | undefined = process.argv[1],
+  platform: NodeJS.Platform = process.platform,
+  origins: Record<string, string> = projectEnvOrigins(),
+  yielded: [string, string][] = projectEnvYielded(),
 ): NodeJS.ProcessEnv {
-  if (!entry || /\.[cm]?ts$/.test(entry)) return env;
-  return { ...env, HYPERFRAMES_CLI_ENTRY: resolve(entry) };
+  const scoped = withOnlyTrustedPathFolders(env, platform);
+  skipWorkingDirectoryInExeSearch(scoped, platform);
+  if (Object.keys(origins).length > 0) scoped[PROJECT_ENV_ORIGINS] = JSON.stringify(origins);
+  if (yielded.length > 0) scoped[PROJECT_ENV_YIELDED] = JSON.stringify(yielded);
+  if (!entry || /\.[cm]?ts$/.test(entry)) return scoped;
+  return { ...scoped, HYPERFRAMES_CLI_ENTRY: resolve(entry) };
 }
 
 type InvokeMediaUse = (verb: MediaUseVerb) => never | Promise<never>;

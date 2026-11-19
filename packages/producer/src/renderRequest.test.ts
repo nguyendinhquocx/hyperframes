@@ -66,6 +66,47 @@ describe("RenderRequest", () => {
     ).toBe("off");
   });
 
+  it("carries strictVariables through the in-process and distributed adapters, and refuses a non-boolean", () => {
+    const value = request();
+    value.options.strictVariables = true;
+    expect(renderConfigFromRequest(value).strictVariables).toBe(true);
+    const config = distributedConfigFromRequest(value);
+    expect(config.strictVariables).toBe(true);
+    expect(
+      renderRequestFromDistributedConfig({
+        projectDir: value.projectDir,
+        outputPath: value.outputPath,
+        config,
+      }).options.strictVariables,
+    ).toBe(true);
+    expect(() =>
+      parseRenderRequest({ ...value, options: { ...value.options, strictVariables: "yes" } }),
+    ).toThrow(/strictVariables must be a boolean/);
+  });
+  it("carries expectedOutputDimensions through the in-process and distributed adapters, and refuses invalid dimensions", () => {
+    const value = request();
+    value.options.expectedOutputDimensions = { width: 1280, height: 720 };
+    expect(renderConfigFromRequest(value).expectedOutputDimensions).toEqual({
+      width: 1280,
+      height: 720,
+    });
+    const config = distributedConfigFromRequest(value);
+    expect(config.expectedOutputDimensions).toEqual({ width: 1280, height: 720 });
+    expect(
+      renderRequestFromDistributedConfig({
+        projectDir: value.projectDir,
+        outputPath: value.outputPath,
+        config,
+      }).options.expectedOutputDimensions,
+    ).toEqual({ width: 1280, height: 720 });
+    expect(() =>
+      parseRenderRequest({
+        ...value,
+        options: { ...value.options, expectedOutputDimensions: "yes" },
+      }),
+    ).toThrow(/expectedOutputDimensions/);
+  });
+
   it("carries the delivery encoder options through every adapter", () => {
     const value = request();
     Object.assign(value.options, {

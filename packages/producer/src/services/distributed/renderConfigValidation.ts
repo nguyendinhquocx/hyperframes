@@ -1,3 +1,4 @@
+import { isExpectedOutputDimensions } from "../render/outputDimensions.js";
 /**
  * Cloud-agnostic validation of a serializable `DistributedRenderConfig`.
  *
@@ -90,6 +91,15 @@ export function validateDistributedRenderConfig(
     );
   }
 
+  if (
+    config.expectedOutputDimensions !== undefined &&
+    !isExpectedOutputDimensions(config.expectedOutputDimensions)
+  ) {
+    throw new InvalidConfigError(
+      "config.expectedOutputDimensions",
+      "must contain positive integer width and height",
+    );
+  }
   validateIntDimension("config.width", config.width);
   validateIntDimension("config.height", config.height);
 
@@ -271,6 +281,9 @@ export function validateDistributedRenderConfig(
 
   if (config.variables !== undefined) {
     validateVariablesPayload(config.variables);
+  }
+  if (config.strictVariables !== undefined && typeof config.strictVariables !== "boolean") {
+    throw new InvalidConfigError("config.strictVariables", "must be a boolean");
   }
   if (config.engineConfig !== undefined) {
     try {

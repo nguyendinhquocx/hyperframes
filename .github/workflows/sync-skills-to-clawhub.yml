@@ -28,6 +28,10 @@ permissions:
 jobs:
   sync:
     name: Publish changed skills
+    # A dispatch runs this file from the chosen branch, so only main may reach the token.
+    if: github.ref == 'refs/heads/main'
+    # The token is an environment secret; the environment admits only main.
+    environment: clawhub
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:

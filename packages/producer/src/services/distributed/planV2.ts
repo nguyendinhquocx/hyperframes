@@ -160,6 +160,10 @@ export interface PlanV2WithPublisherOptions {
   readonly remoteFiles?: BuildLocalExecutionPlanOptions["remoteFiles"];
   readonly chunksCarryAudio?: boolean;
   readonly deferAudio?: boolean;
+  readonly onPlanned?: (summary: {
+    readonly strictVariablesChecked?: boolean;
+    readonly outputDimensionsChecked?: boolean;
+  }) => void;
 }
 
 export interface PlanV2MaterializationResult {
@@ -772,7 +776,7 @@ export async function planV2WithPublisher(
   const stagingRoot = createStagingDir(options.stagingParentDir ?? tmpdir(), ".execution-plan-");
   const digests: PlanFileDigests = new Map();
   try {
-    await buildLocalExecutionPlan(projectDir, config, stagingRoot, {
+    const planned = await buildLocalExecutionPlan(projectDir, config, stagingRoot, {
       executionPlanSizeLimitBytes: Number.MAX_SAFE_INTEGER,
       deferVideoExtraction: true,
       remoteFiles: options.remoteFiles,
@@ -788,6 +792,10 @@ export async function planV2WithPublisher(
       chunksCarryAudio: options.chunksCarryAudio,
       sliceChunkAudio: true,
       deferAudio: options.deferAudio,
+    });
+    options.onPlanned?.({
+      strictVariablesChecked: planned.strictVariablesChecked,
+      outputDimensionsChecked: planned.outputDimensionsChecked,
     });
     return await publishExecutionPlan(stagingRoot, publisher, { digests, log: config.logger });
   } catch (error) {

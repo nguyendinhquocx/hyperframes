@@ -418,10 +418,6 @@ jobs:
           - lane: engine-cli
             packages: --filter @hyperframes/engine --filter @hyperframes/cli
             runtime_contract: true
-          - lane: engine-cli-3
-            packages: --filter @hyperframes/engine --filter @hyperframes/cli
-            test_shard: 3/3
-            process_tests: true
 
     steps:
       - name: Disable Windows Defender real-time monitoring

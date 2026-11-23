@@ -3,7 +3,7 @@ import type { DragCommitDeps, TimelineMoveEdit } from "./timelineClipDragCommit"
 import type { DraggedClipState } from "./timelineClipDragTypes";
 import { isLinkedSelectionOn } from "../../utils/linkedClipPreferences";
 import { sharesLinkGroup } from "./audioClipLink";
-import { timeRangesOverlap } from "./timelineCollision";
+import { landsOnLaneClip, timeRangesOverlap } from "./timelineCollision";
 import { getTimelineEditCapabilities } from "./timelineEditing";
 import { round3, TRACK_GAP_EPSILON_S } from "./timelineGaps";
 import { isMainTrackElement } from "./timelineZones";
@@ -47,22 +47,8 @@ export function resolveMainTrackInsert(
     return [{ element: partner, start: round3(partner.start + lead.start - lead.element.start) }];
   });
   const moves = [...main, ...partners];
-  const moving = new Set(moves.map((m) => keyOf(m.element)));
-  // A partner may not land on a clip that stays put in its lane; main-track moves only reorder, so they cannot.
-  const lands = partners.some(({ element, start }) =>
-    elements.some(
-      (other) =>
-        other.track === element.track &&
-        !moving.has(keyOf(other)) &&
-        timeRangesOverlap(
-          start,
-          start + element.duration,
-          other.start,
-          other.start + other.duration,
-        ),
-    ),
-  );
-  if (lands) return null;
+  // A partner may not land on a clip in its lane, moved or not, nor start before 0; main-track moves only reorder.
+  if (landsOnLaneClip(elements, moves, partners) || partners.some((p) => p.start < 0)) return null;
   return moves.every((m) => getTimelineEditCapabilities(m.element).canMove) ? moves : null;
 }
 

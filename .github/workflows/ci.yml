@@ -9,6 +9,8 @@ permissions:
 # External users' CI continues to emit telemetry unless they set this themselves.
 env:
   HYPERFRAMES_NO_TELEMETRY: "1"
+  # The edit accuracy shard count; studio-edit-accuracy's matrix lists the same shards (its strategy cannot read env).
+  EDIT_ACCURACY_SHARDS: ${{ github.event_name == 'merge_group' && 30 || 15 }}
 
 on:
   merge_group:

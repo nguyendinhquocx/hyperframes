@@ -26,6 +26,13 @@ import type {
 } from "./useTimelineGroupEditing";
 import { studioApiFetch } from "../utils/studioApiFetch";
 import { countOf } from "../utils/countOf";
+import {
+  enqueueTimelineEdit,
+  isClosed,
+  whileShown,
+  refuseWithEarlier,
+  type TimelineEditQueue,
+} from "./timelineEditQueue";
 import { createStudioSaveHttpError } from "../utils/studioSaveDiagnostics";
 
 /** Apply already-resolved ripple changes to the surviving elements for the
@@ -42,8 +49,22 @@ export function applyRippleShifts(
   });
 }
 
+/** Move the clips one delete's ripple shifted back on the timeline as it is now and put
+ *  `restore` back, so a later delete still saving stays gone. */
+function undoRippleShift(changes: TimelineGroupMoveChange[] | null, restore: TimelineElement[]) {
+  const keyOf = (te: TimelineElement) => te.key ?? te.id;
+  const back = new Map<string, number>(
+    changes?.map((c) => [keyOf(c.element), c.element.start - c.start]),
+  );
+  const { elements, setElements } = usePlayerStore.getState();
+  const unshifted = elements.map((te) => {
+    const by = back.get(keyOf(te));
+    return by ? { ...te, start: te.start + by } : te;
+  });
+  setElements([...unshifted, ...restore]);
+}
+
 interface UseTimelineDeleteOpsOptions {
-  projectIdRef: MutableRefObject<string | null>;
   activeCompPath: string | null;
   showToast: (message: string, tone?: "error" | "info") => void;
   writeProjectFile: (path: string, content: string, expectedContent?: string) => Promise<void>;
@@ -52,7 +73,7 @@ interface UseTimelineDeleteOpsOptions {
   isRecordingRef?: MutableRefObject<boolean>;
   forceReloadSdkSession?: () => void;
   previewIframeRef: RefObject<HTMLIFrameElement | null>;
-  editQueueRef: MutableRefObject<Promise<void>>;
+  editQueueRef: TimelineEditQueue;
   /** The same atomic multi-clip move commit the track-gap menu uses, reused
    *  to ripple the main track after a delete, folded into the delete's own
    *  undo entry via a shared coalesceKey. */
@@ -68,7 +89,6 @@ function unlinkInSource(source: string, survivors: readonly TimelineElement[]): 
 }
 
 export function useTimelineDeleteOps({
-  projectIdRef,
   activeCompPath,
   showToast,
   writeProjectFile,
@@ -92,8 +112,7 @@ export function useTimelineDeleteOps({
         showToast("Cannot edit timeline while recording", "error");
         return;
       }
-      const pid = projectIdRef.current;
-      if (!pid) throw new Error("No active project");
+      if (!editQueueRef.projectId) throw new Error("No active project");
       const [element] = selection;
       if (!element) return;
       const label =
@@ -128,7 +147,7 @@ export function useTimelineDeleteOps({
         usePlayerStore.getState().setElements(applyRippleShifts(survivors, rippleChanges));
         removeIframeTimelineElements(previewIframeRef.current, sameFile, activeCompPath);
         let rollbackDuration = () => {};
-        const deleted = editQueueRef.current.then(async () => {
+        const deleted = enqueueTimelineEdit(editQueueRef, async (pid) => {
           await saveServerRewriteWithHistory({
             projectId: pid,
             path: targetPath,
@@ -173,20 +192,22 @@ export function useTimelineDeleteOps({
               const patchedContent = unlinkInSource(synced.source, alsoUnlink);
               // Optimistically reflect the shrunk length in the readout/seek bar,
               // rolling it back if the persist below fails (see captureDurationRollback).
-              rollbackDuration = captureDurationRollback(previewIframeRef.current);
-              if (synced.contentEnd > 0 && targetPath === (activeCompPath || "index.html")) {
-                usePlayerStore.getState().setDuration(synced.contentEnd);
-              }
+              whileShown(editQueueRef, () => {
+                rollbackDuration = captureDurationRollback(previewIframeRef.current);
+                if (synced.contentEnd > 0 && targetPath === (activeCompPath || "index.html")) {
+                  usePlayerStore.getState().setDuration(synced.contentEnd);
+                }
+              });
               return { disk: removedContent, after: patchedContent };
             },
           });
         });
-        editQueueRef.current = deleted.catch(() => undefined);
         // One call queues both, so no later edit can land between the delete and its shift.
         const shifted =
           rippleChanges &&
           handleTimelineGroupMove(rippleChanges, {
             beforeTiming: deleted,
+            ifEarlierRefused: refuseWithEarlier,
             coalesceKey: step.coalesceKey,
             // Coalescing keeps the LAST entry's label; without this the undo
             // toast reads "Undid Move timeline clips" after a delete, naming
@@ -199,10 +220,12 @@ export function useTimelineDeleteOps({
         try {
           await deleted;
         } catch (error) {
-          rollbackDuration();
-          usePlayerStore.getState().setElements(elements);
           void shifted?.catch(() => undefined);
-          reloadPreview();
+          whileShown(editQueueRef, () => {
+            rollbackDuration();
+            undoRippleShift(rippleChanges, sameFile);
+            reloadPreview();
+          });
           throw error;
         }
         let rippleFailed = false;
@@ -214,12 +237,13 @@ export function useTimelineDeleteOps({
             // toggle-off behaviour would have left anyway — not worth undoing
             // an otherwise-successful delete over.
             rippleFailed = true;
-            usePlayerStore.getState().setElements(survivors);
+            whileShown(editQueueRef, () => undoRippleShift(rippleChanges, []));
             console.error("[Timeline] ripple-edit failed to persist after delete", error);
             showToast("Clip deleted, but the gap could not be closed.", "error");
           }
         }
 
+        if (isClosed(editQueueRef)) return;
         usePlayerStore.getState().setSelectedElementId(null);
         usePlayerStore.getState().setSelectedElementIds(new Set());
         forceReloadSdkSession?.();
@@ -247,7 +271,6 @@ export function useTimelineDeleteOps({
     },
     [
       activeCompPath,
-      projectIdRef,
       recordEdit,
       showToast,
       writeProjectFile,

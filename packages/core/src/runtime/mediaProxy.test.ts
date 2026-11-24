@@ -716,6 +716,66 @@ describe("waiting for the proxy copy", () => {
     expect(active.hasAttribute("poster")).toBe(false);
   });
 
+  describe("on a hidden capture page", () => {
+    const clipAt = (el: HTMLVideoElement) =>
+      syncRuntimeMedia({
+        clips: [
+          {
+            el,
+            start: 0,
+            mediaStart: 4,
+            duration: 10,
+            end: 10,
+            volume: null,
+            playbackRate: 1,
+            loop: false,
+            sourceDuration: null,
+          },
+        ],
+        timeSeconds: 1,
+        playing: false,
+        playbackRate: 1,
+      });
+    const onCapturePage = () => {
+      const mark = document.head.appendChild(document.createElement("meta"));
+      mark.name = STUDIO_PREVIEW_MARK_META;
+      mark.content = STUDIO_PREVIEW_CAPTURE_MODE;
+    };
+
+    // fails without the fix: a thumbnail capture page asked for its copy ahead of the rest whenever its clip was at the
+    // playhead, and the server made it before the copy the person's preview was waiting on.
+    it("asks for its copy behind the rest, even with the clip at the playhead", async () => {
+      vi.useFakeTimers();
+      onCapturePage();
+      const route = stubProxyRoute(202, 206);
+      const el = createVideo("/clip.mov");
+      clipAt(el);
+
+      swapToProxy(el, HEVC_ENTRY, "proactive");
+      await vi.advanceTimersByTimeAsync(3_000);
+
+      expect(route.mock.calls.map((call) => (call[1] as RequestInit).headers)).toEqual([
+        { Range: "bytes=0-0", "X-HF-Proxy-Priority": "0" },
+        { Range: "bytes=0-0", "X-HF-Proxy-Priority": "0" },
+      ]);
+    });
+
+    // `hyperframes check` pages carry the same capture mark, and audit each sample time with the copy's frames.
+    it("still swaps to its copy once it is served", async () => {
+      vi.useFakeTimers();
+      onCapturePage();
+      stubProxyRoute(206);
+      const el = createVideo("/clip.mov");
+      clipAt(el);
+
+      swapToProxy(el, HEVC_ENTRY, "proactive");
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(proxyVariant(el)).toBe("h264");
+      expect(el.load).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("ignores the original's own metadata and error while the copy is being made", async () => {
     vi.useFakeTimers();
     window.__HF_MEDIA_CODEC_MAP__ = {};
@@ -1292,6 +1352,116 @@ describe("preview quality: lighter copies of heavy files", () => {
       } finally {
         mark.remove();
       }
+    });
+
+    // fails without the fix: the still was asked without the lighter-copy mark, so Studio's server refused it for a
+    // browser-safe H.264 file (422 browser_safe_codec) and the held clip showed black for as long as its copy took.
+    it("stands in its own frame from the server, asked as a lighter copy's still, while it is held", async () => {
+      const { el } = await waitingForItsCopy(making);
+      const media = await import("./media");
+      media.syncRuntimeMedia({
+        clips: [
+          {
+            el,
+            start: 0,
+            mediaStart: 4,
+            duration: 10,
+            end: 10,
+            volume: null,
+            playbackRate: 1,
+            loop: false,
+            sourceDuration: null,
+          },
+        ],
+        timeSeconds: 1,
+        playing: false,
+        playbackRate: 1,
+        getCompositionDuration: () => 0,
+      });
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      const poster = new URL(el.getAttribute("poster")!, document.baseURI);
+      expect([...poster.searchParams]).toEqual([
+        ["hf-proxy", "auto"],
+        ["hf-proxy-box", "2048x1218"],
+        ["hf-proxy-light", "1"],
+        ["hf-proxy-still", "5.0"],
+      ]);
+    });
+
+    async function twoHeldOnScreen(facts: PreviewSourceFacts = HEAVY) {
+      vi.useFakeTimers();
+      let made = false;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) =>
+          !String(url).includes("hf-proxy") || made ? new Response("x", { status: 206 }) : making(),
+        ),
+      );
+      const staged = await stage({ "/a.mp4": facts, "/b.mp4": facts });
+      const [a, b] = [staged.video("/a.mp4"), staged.video("/b.mp4")];
+      for (const el of [a, b]) staged.maybeProxyProactively(el);
+      await vi.advanceTimersByTimeAsync(0);
+      const preload = await import("./preloadMedia");
+      const proxySrc = await import("./proxySrc");
+      // One media tick, as init.ts runs it: each clip and whether it is on screen.
+      const tick = (onScreen: HTMLVideoElement | null) => {
+        for (const el of [a, b]) staged.decideFileTurn(el, el === onScreen);
+        return [a.getAttribute("src"), b.getAttribute("src")];
+      };
+      return { ...staged, a, b, tick, preload, proxySrc, made: () => (made = true) };
+    }
+
+    // fails without the fix: every clip near the playhead stayed held with no picture until its copy was made, so a
+    // 4K clip on screen showed a frozen frame for as long as its copy took (6.7 s for a 15 s clip).
+    it("lets one clip on screen play its own file while its copy is made, and keeps the rest held", async () => {
+      const { a, b, decideFileTurn } = await twoHeldOnScreen();
+      expect([a.hasAttribute("src"), b.hasAttribute("src")]).toEqual([false, false]);
+
+      decideFileTurn(a, true);
+      decideFileTurn(b, true);
+
+      expect([a.getAttribute("src"), b.getAttribute("src")]).toEqual(["/a.mp4", null]);
+    });
+
+    // A scrub or a loop crosses clips whose copies are still being made: a clip that leaves the screen goes back on
+    // hold, or each one shown once would keep its oversized file for good.
+    it("holds a clip again once it leaves the screen, so clips crossing the playhead play their own file one at a time", async () => {
+      const { a, b, tick, preload, proxySrc } = await twoHeldOnScreen();
+
+      expect(tick(a)).toEqual(["/a.mp4", null]);
+      expect(tick(b)).toEqual([null, "/b.mp4"]);
+      expect(proxySrc.heldForCopy.has(a)).toBe(true);
+
+      preload.giveBackWhenDue(a);
+      expect(a.hasAttribute("src")).toBe(false);
+      expect(tick(a)).toEqual([null, null]);
+      expect(tick(a)).toEqual(["/a.mp4", null]);
+    });
+
+    it("still swaps the clip that played its own file to its copy once the copy is made", async () => {
+      const { a, decideFileTurn, made } = await twoHeldOnScreen();
+      decideFileTurn(a, true);
+
+      made();
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      expect(params(a).get("hf-proxy-box")).toBe("2048x1218");
+    });
+
+    it("keeps a file deeper than 8 bits held where the browser does not name its codec at that depth", async () => {
+      const { a, decideFileTurn } = await twoHeldOnScreen({
+        ...HEAVY,
+        bitDepth: 10,
+        codec: "h264",
+      });
+      a.canPlayType = vi.fn((mime: string) =>
+        mime.includes("avc1.6E") ? "" : "probably",
+      ) as never;
+
+      decideFileTurn(a, true);
+
+      expect(a.hasAttribute("src")).toBe(false);
     });
 
     it("is not given its file back as its clip comes due", async () => {

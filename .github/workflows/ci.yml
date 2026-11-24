@@ -225,7 +225,8 @@ jobs:
 
   build:
     name: Build
-    needs: changes
+    # Release checks is not a required check; a release whose checks fail must fail this one so it cannot merge.
+    needs: [changes, release-checks]
     # A skipped required check passes, so a broken change detection must fail it instead.
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: ubuntu-latest
@@ -437,7 +438,7 @@ jobs:
       - run: bun run typecheck:scripts
 
   test-studio:
-    name: Test (studio)
+    name: Test (studio ${{ matrix.shard }}/3)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest

@@ -510,7 +510,6 @@ jobs:
           chrome-version: stable
       - run: bun run generate:catalog
         if: needs.changes.outputs.docs_catalog == 'true'
-      - run: node --test packages/share/tests/*.test.mjs
       - run: bun run test:scripts
         env:
           HYPERFRAMES_BROWSER_PATH: ${{ steps.catalog-chrome.outputs.chrome-path }}

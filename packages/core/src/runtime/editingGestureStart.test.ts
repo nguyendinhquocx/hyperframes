@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { gestureBase, gestureStart } from "./editingGestureStart";
+import { gestureBase, gestureStart, withoutGsapTakeover } from "./editingGestureStart";
 import { handleFor } from "./editingHandles";
 
 type Tween = { vars: Record<string, unknown>; targets: () => unknown[]; duration: () => number };
@@ -179,7 +179,12 @@ describe("gesture start", () => {
   ])("owns its position through %s", (_name, make, moving) => {
     const card = turnedCard("");
     gsapWith([make(card), tween(card, { opacity: 0 }, 3)]);
-    expect(gestureStart([handleFor(card)]).elements[0]!.gsap).toEqual({ x: 200, y: 5, moving });
+    expect(gestureStart([handleFor(card)]).elements[0]!.gsap).toEqual({
+      x: 200,
+      y: 5,
+      moving,
+      drawsTranslate: true,
+    });
   });
 
   // fails without the fix: a sealed rotate never learned GSAP turns the element, so it saved a CSS rotate.
@@ -257,7 +262,13 @@ describe("gestureBase", () => {
   it("reads GSAP's x, y, opacity and scale for a layer no tween touches", () => {
     const card = turnedCard("");
     gsapWith([], { x: 12, y: -4, opacity: 0.5, scaleX: 1.5 });
-    expect(gestureBase(handleFor(card))).toEqual({ x: 12, y: -4, opacity: 0.5, scale: 1.5 });
+    expect(gestureBase(handleFor(card))).toEqual({
+      x: 12,
+      y: -4,
+      opacity: 0.5,
+      scale: 1.5,
+      drawsProps: true,
+    });
   });
 
   // fails without the fix: a page without GSAP answered null, so a sealed recording refused to start where the
@@ -272,5 +283,59 @@ describe("gestureBase", () => {
     expect(gestureBase("0123456789abcdef:999")).toBeNull();
     Reflect.deleteProperty(window, "gsap");
     expect(gestureBase("0123456789abcdef:999")).toBeNull();
+  });
+});
+
+describe("withoutGsapTakeover", () => {
+  type Cached = { _gsap?: Record<string, unknown> };
+
+  it("puts back the attributes and GSAP cache a read changes on an element GSAP does not draw", () => {
+    document.body.innerHTML = `<h1 id="title" style="translate: 0 -200px">Title</h1>`;
+    const title = document.getElementById("title")! as HTMLElement & Cached;
+    const origin = { x: 1 };
+    title._gsap = { x: 0, origin };
+    const value = withoutGsapTakeover(title, () => {
+      title.style.translate = "none";
+      title.setAttribute("data-svg-origin", "10 20");
+      Object.assign(title._gsap!, { x: -200, renderTransform: () => {} });
+      origin.x = 99;
+      return 7;
+    });
+    expect(value).toBe(7);
+    expect(title.getAttribute("style")).toBe("translate: 0 -200px");
+    expect(title.hasAttribute("data-svg-origin")).toBe(false);
+    expect(title._gsap).toEqual({ x: 0, origin: { x: 1 } });
+    expect(title._gsap!.origin).toBe(origin);
+  });
+
+  it("puts back what a read changed when the read throws", () => {
+    document.body.innerHTML = `<h1 id="title" style="translate: 0 -200px">Title</h1>`;
+    const title = document.getElementById("title")! as HTMLElement & Cached;
+    title._gsap = { x: 0 };
+    expect(() =>
+      withoutGsapTakeover(title, () => {
+        title.style.translate = "none";
+        title._gsap!.renderTransform = () => {};
+        throw new Error("GSAP failed");
+      }),
+    ).toThrow("GSAP failed");
+    expect(title.getAttribute("style")).toBe("translate: 0 -200px");
+    expect(title._gsap).toEqual({ x: 0 });
+  });
+
+  it("drops a GSAP cache the read created", () => {
+    document.body.innerHTML = `<h1 id="title">Title</h1>`;
+    const title = document.getElementById("title")! as HTMLElement & Cached;
+    withoutGsapTakeover(title, () => (title._gsap = { renderTransform: () => {} }));
+    expect("_gsap" in title).toBe(false);
+  });
+
+  it("leaves an element GSAP already draws to GSAP", () => {
+    document.body.innerHTML = `<h1 id="title">Title</h1>`;
+    const title = document.getElementById("title")! as HTMLElement & Cached;
+    const renderTransform = () => {};
+    title._gsap = { renderTransform };
+    withoutGsapTakeover(title, () => title.setAttribute("style", "transform: scale(2)"));
+    expect(title.getAttribute("style")).toBe("transform: scale(2)");
   });
 });

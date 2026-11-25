@@ -57,9 +57,15 @@ export function capturePageIn(doc: Document): boolean {
     STUDIO_PREVIEW_CAPTURE_MODE
   );
 }
+export const CAPTURE_STILLS = "hf-capture-stills";
+export const CAPTURE_STILL_ATTR = "data-hf-capture-still";
+export function captureStillsIn(doc: Document): boolean {
+  return capturePageIn(doc) && doc.querySelector(`meta[name="${CAPTURE_STILLS}"]`) !== null;
+}
 export const STUDIO_PREVIEW_UPCOMING_ATTR = "data-hf-upcoming";
 export const STUDIO_PREVIEW_LAZY_ATTR = "data-hf-preview-lazy";
 export const STUDIO_PREVIEW_ERRORS = "__hfPreviewErrors";
+export const STUDIO_PREVIEW_ERROR_MESSAGE = "preview-error";
 export const STUDIO_PREVIEW_ERROR_KINDS = "__hfPreviewErrorKinds";
 export function previewConsoleErrorText(args: readonly unknown[]): string | null {
   const text = args.map((a) => (a instanceof Error ? a.message : String(a))).join(" ");

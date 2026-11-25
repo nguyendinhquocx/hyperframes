@@ -1,6 +1,6 @@
 {
   "name": "@hyperframes/core",
-  "version": "0.9.87",
+  "version": "0.9.93",
   "description": "",
   "repository": {
     "type": "git",
@@ -169,6 +169,12 @@
       "node": "./dist/utils/richTextSanitize.js",
       "import": "./src/utils/richTextSanitize.ts",
       "types": "./src/utils/richTextSanitize.ts"
+    },
+    "./inline-text-style": {
+      "bun": "./src/utils/inlineTextStyleRead.ts",
+      "node": "./dist/utils/inlineTextStyleRead.js",
+      "import": "./src/utils/inlineTextStyleRead.ts",
+      "types": "./src/utils/inlineTextStyleRead.ts"
     },
     "./composition-contract": {
       "bun": "./src/compositionContract.ts",
@@ -398,6 +404,12 @@
       "import": "./src/audioFade.ts",
       "types": "./src/audioFade.ts"
     },
+    "./audio-decode": {
+      "bun": "./src/audioDecode.ts",
+      "node": "./dist/audioDecode.js",
+      "import": "./src/audioDecode.ts",
+      "types": "./src/audioDecode.ts"
+    },
     "./speed-ramp": {
       "bun": "./src/speedRamp.ts",
       "node": "./dist/speedRamp.js",
@@ -554,6 +566,12 @@
       "node": "./dist/compiler/compositionSizeLimit.js",
       "import": "./src/compiler/compositionSizeLimit.ts",
       "types": "./src/compiler/compositionSizeLimit.ts"
+    },
+    "./compiler/html-tokens": {
+      "bun": "./src/compiler/htmlTokens.ts",
+      "node": "./dist/compiler/htmlTokens.js",
+      "import": "./src/compiler/htmlTokens.ts",
+      "types": "./src/compiler/htmlTokens.ts"
     },
     "./compiler/html-document": {
       "bun": "./src/compiler/htmlDocument.ts",
@@ -830,6 +848,10 @@
         "import": "./dist/utils/richTextSanitize.js",
         "types": "./dist/utils/richTextSanitize.d.ts"
       },
+      "./inline-text-style": {
+        "import": "./dist/utils/inlineTextStyleRead.js",
+        "types": "./dist/utils/inlineTextStyleRead.d.ts"
+      },
       "./composition-contract": {
         "import": "./dist/compositionContract.js",
         "types": "./dist/compositionContract.d.ts"
@@ -982,6 +1004,10 @@
         "import": "./dist/audioFade.js",
         "types": "./dist/audioFade.d.ts"
       },
+      "./audio-decode": {
+        "import": "./dist/audioDecode.js",
+        "types": "./dist/audioDecode.d.ts"
+      },
       "./speed-ramp": {
         "import": "./dist/speedRamp.js",
         "types": "./dist/speedRamp.d.ts"
@@ -1086,6 +1112,10 @@
       "./compiler/composition-size-limit": {
         "import": "./dist/compiler/compositionSizeLimit.js",
         "types": "./dist/compiler/compositionSizeLimit.d.ts"
+      },
+      "./compiler/html-tokens": {
+        "import": "./dist/compiler/htmlTokens.js",
+        "types": "./dist/compiler/htmlTokens.d.ts"
       },
       "./compiler/html-document": {
         "import": "./dist/compiler/htmlDocument.js",

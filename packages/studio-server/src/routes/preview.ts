@@ -16,10 +16,13 @@ import {
   type BundleOptions,
 } from "@hyperframes/core/compiler";
 import {
+  CAPTURE_STILLS,
   STUDIO_PREVIEW_CAPTURE_MODE,
   STUDIO_PREVIEW_MARK_META,
   STUDIO_PREVIEW_ERROR_KINDS,
   STUDIO_PREVIEW_ERRORS,
+  STUDIO_PREVIEW_ERROR_MESSAGE,
+  PREVIEW_FOR_ANOTHER_SITE_META,
 } from "@hyperframes/core/studio-preview-mark";
 import {
   PREVIEW_PROXY_BOX_PARAM,
@@ -41,7 +44,11 @@ import {
   normalizeGsapBaseUrl,
   normalizeGsapLocalRoot,
 } from "@hyperframes/core/gsap-cdn";
-import { findStartTags, injectTagsAtHeadStart } from "@hyperframes/core/compiler/html-document";
+import {
+  findStartTags,
+  headContentStart,
+  injectTagsAtHeadStart,
+} from "@hyperframes/core/compiler/html-document";
 import { hasAuthoredCode } from "../helpers/authoredCode.js";
 import { THUMBNAIL_NO_AUTHORED_CODE_META } from "../helpers/screenshotClip.js";
 import { isWithinProjectRoot } from "@hyperframes/parsers/asset-resolution";
@@ -444,9 +451,8 @@ function gsapCdnFallbackScript(baseUrl: string): string {
 
 function injectGsapCdnFallback(html: string, baseUrl: string): string {
   if (html.includes(GSAP_FALLBACK_ATTR)) return html;
-  if (html.includes("<head>"))
-    return html.replace("<head>", "<head>" + gsapCdnFallbackScript(baseUrl));
-  return gsapCdnFallbackScript(baseUrl) + html;
+  const at = headContentStart(html);
+  return html.slice(0, at) + gsapCdnFallbackScript(baseUrl) + html.slice(at);
 }
 
 /**
@@ -508,7 +514,8 @@ export function scriptJson(value: unknown): string {
 const earlyErrorsScript = (
   runtimeUrl: string,
 ) => `<script>(function(){var seen=window.${STUDIO_PREVIEW_ERRORS}=[],kinds=window.${STUDIO_PREVIEW_ERROR_KINDS}=[],known={SyntaxError:1,TypeError:1,ReferenceError:1,RangeError:1},runtime=${scriptJson(new URL(runtimeUrl, "http://x").pathname)};
-addEventListener("error",function(e){seen.push(e.message||String(e));
+addEventListener("error",function(e){var message=e.message||String(e);seen.push(message);
+if(!document.querySelector('meta[name="${PREVIEW_FOR_ANOTHER_SITE_META}"]'))try{parent.postMessage({source:"hf-preview",type:"${STUDIO_PREVIEW_ERROR_MESSAGE}",message:message},"*")}catch(_){}
 var name=e.error&&e.error.constructor&&e.error.constructor.name,path="";
 try{var url=e.filename&&new URL(e.filename,window.location.href);if(url&&url.origin===window.location.origin)path=url.pathname}catch(_){}
 kinds.push({name:known[name]===1?name:"other",origin:!path?"unknown":path===runtime?"runtime":path.indexOf("/api/projects/")===0?"project":"studio"})});})();</script>`;
@@ -830,8 +837,11 @@ export function registerPreviewRoutes(
     if (vars.error !== undefined) return c.json({ error: vars.error }, 400);
     const previewVariables = vars.values;
     const capture = c.req.query(PREVIEW_CAPTURE_PARAM) !== undefined;
+    const stills = capture && c.req.query(CAPTURE_STILLS) !== undefined;
+    const marked = (html: string) =>
+      stills ? injectTagsAtHeadStart(html, `<meta name="${CAPTURE_STILLS}">`) : html;
 
-    const etag = `"preview:${signature}${gsapEtagSalt}${variablesEtagSalt(vars.raw)}${capture ? ":capture" : ""}"`;
+    const etag = `"preview:${signature}${gsapEtagSalt}${variablesEtagSalt(vars.raw)}${capture ? ":capture" : ""}${stills ? ":stills" : ""}"`;
     const ifNoneMatch = c.req.header("If-None-Match");
     if (ifNoneMatch === etag) {
       return new Response(null, {
@@ -843,7 +853,7 @@ export function registerPreviewRoutes(
     const cached = builtPreviews.get(builtKey) ?? adapter.previewDocuments?.read(builtKey);
     if (cached) {
       rememberPreview(builtKey, cached);
-      return c.html(cached, 200, previewCacheHeaders(etag));
+      return c.html(marked(cached), 200, previewCacheHeaders(etag));
     }
     let pending = previewBuilds.get(builtKey);
     if (!pending) {
@@ -854,7 +864,7 @@ export function registerPreviewRoutes(
     }
     const html = await pending;
     if (!html) return c.text("not found", 404);
-    return c.html(html, 200, previewCacheHeaders(etag));
+    return c.html(marked(html), 200, previewCacheHeaders(etag));
   });
 
   // Sub-composition preview
@@ -868,10 +878,8 @@ export function registerPreviewRoutes(
     const vars = previewVariablesFromRequest(c.req.query("variables"));
     if (vars.error !== undefined) return c.json({ error: vars.error }, 400);
     const previewVariables = vars.values;
-    const compFile = resolveWithinProject(
-      project.dir,
-      requestSubPath(c.req.url, "projects/:id/preview/comp"),
-    );
+    const requested = requestSubPath(c.req.url, "projects/:id/preview/comp");
+    const compFile = requested === null ? null : resolveWithinProject(project.dir, requested);
     // The sub-composition document takes its head from the root.
     await recordPreviewReadsOff(project.dir, compFile ? [compFile, "index.html"] : ["index.html"]);
     if (!compFile || !existsSync(compFile) || !statSync(compFile).isFile()) {
@@ -949,6 +957,7 @@ export function registerPreviewRoutes(
     const project = await adapter.resolveProject(c.req.param("id"));
     if (!project) return c.json({ error: "not found" }, 404);
     const subPath = requestSubPath(c.req.url, "projects/:id/preview");
+    if (subPath === null) return c.text("not found", 404);
     // Assets are read-only and should mirror the renderer: permit a path that
     // is lexically inside the project even if an explicit project symlink
     // targets a shared directory outside it. Composition source files still

@@ -25,6 +25,7 @@ import {
   PREVIEW_ALLOWED_HOSTS_ENV,
   previewAllowedHostsFromEnv,
 } from "../studio-server/src/helpers/requestIdentity";
+import { TELEMETRY_OPT_OUT_DEFINE } from "./vite.telemetry";
 
 async function loadRuntimeSourceForDev(
   server: import("vite").ViteDevServer,
@@ -212,6 +213,7 @@ export function devProjectApi(): Plugin {
           _api = mod.createStudioApi(adapter, {
             allowedHosts: mod.previewAllowedHostsFromEnv(),
             sandboxThumbnailCaptures: true,
+            sandboxDirectOpens: true,
           });
         }
         return _api;
@@ -365,6 +367,7 @@ export default defineConfig({
   plugins: [react(), tailwindcss(), devProjectApi()],
   define: {
     __STUDIO_VERSION__: JSON.stringify(studioPkg.version),
+    ...TELEMETRY_OPT_OUT_DEFINE,
   },
   resolve: {
     alias: {
@@ -376,6 +379,11 @@ export default defineConfig({
       // openComposition and silently loses its SDK session. See the stub.
       canvas: resolve(__dirname, "src/shims/canvasBrowserStub.js"),
       "@hyperframes/player": resolve(__dirname, "../player/src/hyperframes-player.ts"),
+      // Studio serves the runtime itself, so the player it bundles carries no second copy.
+      "@hyperframes/core/runtime-script": resolve(
+        __dirname,
+        "src/shims/runtimeScriptFromStudio.ts",
+      ),
       "@hyperframes/studio-server/source-mutation": resolve(
         __dirname,
         "../studio-server/src/helpers/sourceMutation.ts",
@@ -417,7 +425,7 @@ export default defineConfig({
   },
   test: {
     exclude: ["data/**", "node_modules/**"],
-    setupFiles: ["src/test-setup.ts"],
+    setupFiles: ["src/test-setup.ts", "../core/vitest.mediaHeader.ts"],
     environmentOptions: {
       happyDOM: { settings: { enableIframePageLoading: true } },
     },

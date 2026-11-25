@@ -2,6 +2,7 @@
 import { rememberSourceLength, sourceLengthOf } from "./sourceLength";
 import { restSceneAt, sceneRestingAt, takeSceneRedrawDue } from "./sceneRest";
 import { wallClearTimeout, wallSetTimeout } from "./wallClock";
+import { runtimeLoad } from "./runtimeLoad";
 import { setPreviewRasterScale } from "./previewRasterHints";
 import { createFarSceneSkip } from "./farScenes";
 import {
@@ -127,6 +128,7 @@ import {
   handleMetadataForProxy,
   isRenderMode,
   maybeProxyProactively,
+  standInCaptureStill,
   decideFileTurn,
   describeVideoSources,
   levelsWithLighterCopies,
@@ -268,6 +270,7 @@ import {
   type StylableElement,
 } from "./domRealm";
 import { audibleVideoNeedsWebAudio, isAudibleVideoElement, parentCopyOf } from "../audibleVideo";
+import { setRuntimePreload } from "./runtimeAttributes";
 
 /**
  * A `window.__timelines` entry is authored content and may be a PARTIAL
@@ -2340,6 +2343,8 @@ export function initSandboxRuntimeModular(): void {
       // group's automation lanes and FX rack with it.
       const isAudioGroupBus = (el: Element): boolean =>
         el.tagName.toLowerCase() === HF_AUDIO_GROUP_TAG;
+      const isRuntimeOwned = (el: Element): boolean =>
+        el.closest("[data-hf-ignore], [data-hyperframes-ignore]") !== null;
       const authoredTimed = new Set<Element>(document.querySelectorAll("[data-start]"));
       const hasAuthoredTimedAncestor = (element: HTMLElement): boolean => {
         let node = element.parentElement;
@@ -2359,6 +2364,7 @@ export function initSandboxRuntimeModular(): void {
               if (!isHtmlElement(target)) continue;
               if (target === rootComp) continue;
               if (isAudioGroupBus(target)) continue;
+              if (isRuntimeOwned(target)) continue;
               if (target.hasAttribute("data-start")) continue;
               if (hasAuthoredTimedAncestor(target)) continue;
               if (seen.has(target)) continue;
@@ -2387,6 +2393,7 @@ export function initSandboxRuntimeModular(): void {
           if (seen.has(el)) continue;
           if (el.tagName === "SCRIPT" || el.tagName === "STYLE" || el.tagName === "LINK") continue;
           if (isAudioGroupBus(el)) continue;
+          if (isRuntimeOwned(el)) continue;
           seen.add(el);
           el.setAttribute("data-start", "0");
           el.setAttribute("data-duration", dur);
@@ -2775,7 +2782,7 @@ export function initSandboxRuntimeModular(): void {
       learnsLength(el) &&
       resolveAbsoluteMediaStartSeconds(el) > state.currentTime + LOOKAHEAD_SECONDS
     ) {
-      el.preload = "metadata";
+      setRuntimePreload(el, "metadata");
       el.load();
     } else preloadMedia(el);
   };
@@ -2791,7 +2798,7 @@ export function initSandboxRuntimeModular(): void {
     }
     if (!freesBufferedVideo(el) || mediaNearPlayhead.get(el) !== false || el.readyState === 0)
       return;
-    el.preload = "none";
+    setRuntimePreload(el, "none");
     withoutOwnTimingRecords(el, () => releaseMedia(el, true));
   };
   const onMediaErrorForProxy = (event: Event) => {
@@ -3379,7 +3386,7 @@ export function initSandboxRuntimeModular(): void {
     mediaNearPlayhead.set(el, near);
     if (!near) {
       const wasPreloading = el.preload !== "none";
-      el.preload = "none";
+      setRuntimePreload(el, "none");
       const video = freesBufferedVideo(el);
       const holdsPipeline = video
         ? decided || el.readyState > 0 || el.networkState === 2
@@ -3612,6 +3619,7 @@ export function initSandboxRuntimeModular(): void {
           currentTime,
           loadsAhead && dueAtLoopStart(rawNode, visibleAt),
         );
+      if (isMediaElement(rawNode)) standInCaptureStill(rawNode, isVisibleNow);
       if (!isMediaElement(rawNode) && !isImageElement(rawNode)) decidedTimedClip = true;
       if (isVideoElement(rawNode) || isImageElement(rawNode)) {
         colorGradingRuntime?.setSourceVisibility(rawNode, isVisibleNow);
@@ -3740,6 +3748,7 @@ export function initSandboxRuntimeModular(): void {
         const explicitDuration = ownDuration != null && ownDuration > 0 ? ownDuration : null;
         return resolveRuntimeMediaClipDuration({
           isVideo: element.tagName === "VIDEO",
+          loops: element.loop,
           sourceDuration,
           hostRemaining,
           explicitDuration,
@@ -5210,8 +5219,8 @@ export function initSandboxRuntimeModular(): void {
         moveMediaWindow(time, clips);
         for (const { el } of clips) {
           if (!isVideoElement(el) || el.videoWidth > 0) continue;
-          if (el.preload === "none") el.preload = "metadata";
-          if (el.networkState !== 2) el.load();
+          if (el.preload === "none") setRuntimePreload(el, "metadata");
+          if (el.networkState !== 2) runtimeLoad(el);
         }
         const requests = clips.flatMap((clip) =>
           isVideoElement(clip.el)
@@ -5265,7 +5274,7 @@ export function initSandboxRuntimeModular(): void {
       moveMediaWindow(time, clips);
       for (const clip of clips) {
         const { el } = clip;
-        if (el.preload !== "auto") el.preload = "auto";
+        if (el.preload !== "auto") setRuntimePreload(el, "auto");
         if (el.readyState === 1 && !el.seeking)
           el.currentTime = mediaElementTime(mediaSourceTimeAt(clip, time));
       }
@@ -6232,7 +6241,7 @@ export function initSandboxRuntimeModular(): void {
       )
       .map((clip) => {
         const { el } = clip;
-        el.preload = "metadata";
+        setRuntimePreload(el, "metadata");
         withoutOwnTimingRecords(el, () => releaseMedia(el));
         if (el.readyState === 0)
           el.addEventListener(

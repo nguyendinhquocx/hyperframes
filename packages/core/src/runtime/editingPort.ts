@@ -148,6 +148,8 @@ export {
   MAX_SNAPSHOT_TEXT,
   MAX_SNAPSHOT_TWEENS,
   MAX_VARS_DEPTH,
+  TARGET_FIELDS,
+  TIMELINE_FIELDS,
 } from "./editing/gsapSnapshotLimits";
 export {
   compositionPoint,
@@ -214,6 +216,7 @@ export const EDITING_REQUEST_KINDS = [
   "max-z-index",
   "crop-lift",
   "edit-element",
+  "remove-elements",
   "stacking-family",
   "gsap-set",
   "patch-tweens",
@@ -301,8 +304,16 @@ export interface EditingRequests {
   "set-loop-start": { params: { seconds: number | null }; result: { applied: boolean } };
   /** The element `selector` first matches, or `handle` names. `styles` is null for none; empty values are left out. */
   "computed-styles": {
-    params: ({ selector: string } | { handle: EditingElementHandle }) & { properties: string[] };
-    result: { styles: Record<string, string> | null };
+    params: (
+      | { selector: string }
+      | { handle: EditingElementHandle }
+      | { selector: string; every: true }
+    ) & { properties: string[] };
+    result: {
+      styles: Record<string, string> | null;
+      matches?: Array<Record<string, string> | null>;
+      truncated?: boolean;
+    };
   };
   "authored-styles": {
     params: { handle: EditingElementHandle; properties: string[] };
@@ -397,6 +408,7 @@ export interface EditingRequests {
     result: { lifted: boolean; clipPath: string | null };
   };
   "edit-element": { params: EditElementParams; result: EditElementResult };
+  "remove-elements": { params: { handles: EditingElementHandle[] }; result: { removed: number } };
   "stacking-family": {
     params: { handle: EditingElementHandle };
     result: { family: EditingStackingSibling[] | null; locked: boolean };
@@ -460,10 +472,16 @@ const isHandle = (value: unknown): value is EditingElementHandle =>
 
 function styleTarget(params: Record<string, unknown>) {
   const keys = Object.keys(params).sort().join();
-  const { selector, handle } = params;
+  const { selector, handle, every, properties } = params;
   if (keys === "properties,selector" && isSelector(selector)) return { selector };
+  if (keys === "every,properties,selector" && every === true && isSelector(selector))
+    return everyMatchProperties(properties) ? { selector, every } : null;
   return keys === "handle,properties" && isHandle(handle) ? { handle } : null;
 }
+
+const EVERY_MATCH_STYLES: readonly string[] = ["display"];
+const everyMatchProperties = (properties: unknown) =>
+  Array.isArray(properties) && properties.every((name) => EVERY_MATCH_STYLES.includes(name));
 
 function styleProperties(properties: unknown): string[] | null {
   if (!Array.isArray(properties) || properties.length > MAX_STYLE_PROPERTIES) return null;
@@ -701,6 +719,7 @@ const PARAM_PARSERS: {
       ? { handle: params.handle, lift: params.lift }
       : null,
   "edit-element": parseEditElement,
+  "remove-elements": handleList,
   "stacking-family": (params) =>
     hasKeys(params, "handle") && isHandle(params.handle) ? { handle: params.handle } : null,
   "gsap-set": gsapSetWithDrafts,
@@ -951,10 +970,19 @@ export {
   takePlainTextOnly,
   textEditResult,
   type TextEditEndedEvent,
+  type TextEditCaret,
   type TextEditResult,
   type TextEditSelection,
   type TextEditSelectionEvent,
 } from "./editing/textEdit";
+export {
+  caretBoxIn,
+  caretColorOf,
+  caretSideAfterKey,
+  placeCaretAtEnd,
+  type CaretBox,
+  type CaretSide,
+} from "./editing/textCaret";
 export {
   parsePausedFrameAsk,
   PAUSED_FRAME_BYTES,

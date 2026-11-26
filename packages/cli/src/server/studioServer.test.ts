@@ -292,7 +292,11 @@ describe("createStudioServer project history (D-491)", () => {
 
   it("waits for the history lock again once a history opened after a busy one", async () => {
     const waits: unknown[] = [];
-    const reopenable = { replacedAtPath: () => true, close: async () => {} };
+    const reopenable = {
+      replacedAtPath: () => true,
+      replacedNow: async () => true,
+      close: async () => {},
+    };
     let opens = 0;
     historyState.open = async (options) => {
       waits.push((options as { ownerWaitMs?: number }).ownerWaitMs);
@@ -584,6 +588,21 @@ describe("createStudioServer shutdown", () => {
 
     releaseFirstRender();
     await shutdownPromise;
+  });
+
+  it("renders the part of the film a job asks for", async () => {
+    let rendered: unknown;
+    producerState.executeRenderJob = async (job) => {
+      rendered = job;
+    };
+    server = createStudioServer({ projectDir: tmpProject() });
+    const job = server.adapter.startRender({
+      ...startRenderOpts("job-range", join(tmpdir(), "part.mp4")),
+      range: { startSeconds: 2, endSeconds: 4 },
+    });
+
+    await vi.waitFor(() => expect(job.status, job.error).toBe("complete"));
+    expect(rendered).toMatchObject({ range: { startSeconds: 2, endSeconds: 4 } });
   });
 
   const thumbnailOpts = () => ({

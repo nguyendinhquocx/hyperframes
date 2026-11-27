@@ -35,7 +35,8 @@ import {
 import { collectSnapContext, buildExcludeElements, type SnapContext } from "./snapTargetCollection";
 import { measureLiveGrow, type PreviewGestureStart } from "./previewGestureStartRead";
 import { endPreviewDraft } from "./previewDrafts";
-import { previewFrameOpaque } from "../../player/lib/previewChannel";
+import { armSealedRawSteps } from "./gestureSteps";
+import { holdRefreshReadsWhile, previewFrameOpaque } from "../../player/lib/previewChannel";
 import { editsPlainCss } from "../../hooks/gsapRuntimeKeyframes";
 import { logResize, resetResizeMoveLog } from "../../utils/resizeDebug";
 import { logDrag, readDragPositions, resetDragMoveLog } from "../../utils/dragDebug";
@@ -134,6 +135,9 @@ export function startGroupDrag(
       members,
       snapContext,
     };
+    const group = opts.groupGestureRef.current;
+    holdRefreshReadsWhile(() => opts.groupGestureRef.current === group);
+    armSealedRawSteps(opts);
   } catch (error) {
     opts.groupGestureRef.current = null;
     restoreManualOffsetDragMembers(members);
@@ -330,6 +334,9 @@ export function startGesture(
           : undefined,
       resizeGrow: kind === "resize" ? ((start ? start.grow : liveGrow) ?? undefined) : undefined,
     };
+    const gesture = opts.gestureRef.current;
+    holdRefreshReadsWhile(() => opts.gestureRef.current === gesture);
+    armSealedRawSteps(opts);
     if (kind === "resize") {
       resetResizeMoveLog();
       logResize("start", {

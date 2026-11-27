@@ -974,8 +974,10 @@ export function initSandboxRuntimeModular(): void {
     // this runtime currently validates.
     if (forcedWidth) document.documentElement.style.width = forcedWidth;
     if (forcedHeight) document.documentElement.style.height = forcedHeight;
-    if (forcedWidth) document.body.style.width = forcedWidth;
-    if (forcedHeight) document.body.style.height = forcedHeight;
+    if (document.body) {
+      if (forcedWidth) document.body.style.width = forcedWidth;
+      if (forcedHeight) document.body.style.height = forcedHeight;
+    }
   };
 
   const sanitizeCompositionDurationAttributes = () => {
@@ -4085,6 +4087,9 @@ export function initSandboxRuntimeModular(): void {
     lastVisibilityPassSeconds = state.currentTime;
   };
 
+  let lastHandledPlaySeq = 0;
+  let lastPostedPlaySeq = 0;
+
   const postState = (force: boolean) => {
     // Every transport mutation — play, pause, seek, renderSeek, a control-bridge
     // command, the player's own state posts — ends in a forced post. That makes
@@ -4100,12 +4105,14 @@ export function initSandboxRuntimeModular(): void {
       frame !== state.bridgeLastPostedFrame ||
       (state.isPlaying || bufferingFor.length > 0) !== state.bridgeLastPostedPlaying ||
       state.bridgeMuted !== state.bridgeLastPostedMuted ||
+      lastHandledPlaySeq !== lastPostedPlaySeq ||
       now - state.bridgeLastPostedAt >= state.bridgeMaxPostIntervalMs;
     if (!shouldPost) return;
     state.bridgeLastPostedFrame = frame;
     state.bridgeLastPostedPlaying = state.isPlaying || bufferingFor.length > 0;
     state.bridgeLastPostedMuted = state.bridgeMuted;
     state.bridgeLastPostedAt = now;
+    lastPostedPlaySeq = lastHandledPlaySeq;
     postRuntimeMessage({
       source: "hf-preview",
       type: "state",
@@ -4116,6 +4123,7 @@ export function initSandboxRuntimeModular(): void {
       buffering: bufferingFor.length > 0,
       muted: state.bridgeMuted,
       playbackRate: state.playbackRate,
+      playSeq: lastHandledPlaySeq,
     });
   };
 
@@ -4401,7 +4409,7 @@ export function initSandboxRuntimeModular(): void {
     // Per-instance scoped values: data-var-* / --{id} bindings inside scenes. Idempotent.
     applyVariableBindings(document);
     // An unregistered vfx chain paints nothing and logs nothing, so re-scan the new DOM.
-    initVfx(document.body, state.canonicalFps);
+    initVfx(document.body ?? document.documentElement, state.canonicalFps);
     initMotionBlur();
     return captionsApplied;
   };
@@ -4702,7 +4710,7 @@ export function initSandboxRuntimeModular(): void {
         }
       }
     };
-    initVfx(document.body, state.canonicalFps);
+    initVfx(document.body ?? document.documentElement, state.canonicalFps);
     initMotionBlur();
     applyFetchedCaptionOverrides(captionOverrides, captionHosts, rewindCaptionTimelines);
     releaseDetachedMedia();
@@ -5111,11 +5119,11 @@ export function initSandboxRuntimeModular(): void {
     colorGradingRuntime = null;
   });
   // Per-pixel effect chains: compile once here, repaint on every seek below.
-  initVfx(document.body, state.canonicalFps);
+  initVfx(document.body ?? document.documentElement, state.canonicalFps);
   initMotionBlur();
   registerRuntimeCleanup(
     watchSceneWebglContexts(() => {
-      rebuildLostVfx(document.body);
+      rebuildLostVfx(document.body ?? document.documentElement);
       // Effects paint on seeks only. A playing transport redraws the scene itself on its next tick.
       if (clock.isPlaying()) {
         paintVfx(state.currentTime);
@@ -6829,8 +6837,10 @@ export function initSandboxRuntimeModular(): void {
   const scrubAudio = createScrubAudio({ lease: leasePausedMedia, release: releasePausedMedia });
   registerRuntimeCleanup(scrubAudio.stop);
   state.controlBridgeHandler = installRuntimeControlBridge({
-    onPlay: () => {
+    onPlay: (playSeq) => {
+      if (playSeq !== undefined) lastHandledPlaySeq = playSeq;
       player.play();
+      if (lastPostedPlaySeq !== lastHandledPlaySeq) postState(true);
       emitAnalyticsEvent("composition_played", { time: player.getTime() });
     },
     onPause: () => {
@@ -6968,7 +6978,8 @@ export function initSandboxRuntimeModular(): void {
         type: "preview-facts",
         facts: {
           sceneCount: windowScenes.length,
-          mountedElementCount: document.body.querySelectorAll("*").length,
+          mountedElementCount:
+            (document.body ?? document.documentElement)?.querySelectorAll("*").length ?? 0,
           durationSeconds: clock.getDuration(),
           videos: describeVideoSources(),
           lighterAt: lighterLevels(),

@@ -66,6 +66,29 @@ export {
   type PreviewElementHit,
 } from "./player/lib/previewElements";
 export {
+  MAX_STAGE_CLIP_KEYS,
+  MAX_STAGE_ITEMS,
+  measurePreviewStage,
+  type MeasurePreviewStageOptions,
+  type StageMeasuredItem,
+  type StageMeasureResult,
+  type StageTextStart,
+} from "./player/lib/previewStageMeasure";
+export {
+  holdPreviewStage,
+  onPreviewStageActReady,
+  onPreviewStageInput,
+  previewStageDrawer,
+  readyPreviewStage,
+  restorePreviewStage,
+  STAGE_ACT_TIMEOUT_MS,
+  type StageActDraw,
+  type StageActHeld,
+  type StageActHold,
+  type StageActTarget,
+  type StageInputEvent,
+} from "./player/lib/previewStageAct";
+export {
   editSealedSelection,
   findPreviewElementForSelection,
   findPreviewElementForTimelineElement,
@@ -252,6 +275,7 @@ export { useDomEditSession } from "./hooks/useDomEditSession";
 export type { UseDomEditSessionParams } from "./hooks/useDomEditSession";
 export { useLivePreviewIframe } from "./hooks/useLivePreviewIframe";
 export { announcePreviewDocumentLoaded } from "./player/sceneSwap";
+export { shownPreviewFrame } from "./player/lib/previewChannel";
 export type { PreviewPromotion } from "./player/sceneSwap";
 export { usePreviewPersistence } from "./hooks/usePreviewPersistence";
 export type { UsePreviewPersistenceParams } from "./hooks/usePreviewPersistence";

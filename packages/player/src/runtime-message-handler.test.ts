@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { handleRuntimeMessage, type MessageHandlerCallbacks } from "./runtime-message-handler.js";
 import type { ParentMediaManager } from "./parent-media.js";
 import type { ShaderLoaderState } from "./shader-loader-state.js";
-import { runtimeProtocolMetadata } from "@hyperframes/core/runtime/protocol";
+import { MAX_MESSAGE_LIST, runtimeProtocolMetadata } from "@hyperframes/core/runtime/protocol";
 
 // Only the stage-size branch is exercised here; the rest of the callback
 // surface is satisfied with inert spies so the handler's type contract
@@ -243,6 +243,45 @@ describe("handleRuntimeMessage timeline ready", () => {
         ...metadata,
       },
     }) as unknown as MessageEvent;
+
+  // fails without the fix: the scene list was walked to whatever length the film declared.
+  it("reads no scenes from a list too long to walk", () => {
+    const frameWindow = {} as Window;
+    const scene = { id: "s", start: 0, duration: 1 };
+    for (const scenes of [Array(MAX_MESSAGE_LIST + 1).fill(scene), new Array(2 ** 32 - 1)]) {
+      const callbacks = makeCallbacks();
+      handleRuntimeMessage(timelineEvent(120, frameWindow, { scenes }), frameWindow, callbacks);
+      expect(callbacks.setScenes).toHaveBeenCalledWith([]);
+    }
+  });
+
+  // fails without the fix: a refused scene list read as none, with nothing logged.
+  it("logs a refused scene list once, until 10 s have passed", () => {
+    vi.useFakeTimers({ now: Date.now() + 3_600_000 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const frameWindow = {} as Window;
+    const scenes = new Array(2 ** 32 - 1);
+    const post = () =>
+      handleRuntimeMessage(
+        timelineEvent(120, frameWindow, { scenes }),
+        frameWindow,
+        makeCallbacks(),
+      );
+    try {
+      post();
+      post();
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledWith(
+        "[hyperframes-player] ignored the film's scenes list: 4294967295 entries, over the 1000 it reads",
+      );
+      vi.advanceTimersByTime(10_000);
+      post();
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 
   it("reports a finite positive timeline duration in seconds", () => {
     const frameWindow = {} as Window;

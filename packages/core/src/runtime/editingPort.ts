@@ -90,6 +90,20 @@ import {
   type EditElementResult,
 } from "./editing/editElement";
 import {
+  parseStageMeasureParams,
+  type StageMeasureParams,
+  type StageMeasureResult,
+} from "./editing/stageMeasure";
+import {
+  parseStageActParams,
+  stageActReadyEvent,
+  stageInputEvent,
+  type StageActParams,
+  type StageActReadyEvent,
+  type StageActResult,
+  type StageInputEvent,
+} from "./editing/stageAct";
+import {
   parseTextEdit,
   textEditEndedEvent,
   textEditSelectionEvent,
@@ -141,6 +155,37 @@ export {
 } from "./editingGeometry";
 export type { EditingGestureBase, EditingGestureStart } from "./editingGestureStart";
 export { MAX_CAPTION_TRANSFORM } from "./editing/captionTransform";
+export { MAX_EDIT_ENTRIES } from "./editing/editElement";
+export { MAX_FONT_FACES } from "./editing/textStyleReads";
+export {
+  MAX_STAGE_CLIP_KEYS,
+  MAX_STAGE_ITEMS,
+  type StageMeasuredItem,
+  type StageMeasureParams,
+  type StageMeasureResult,
+  type StageTextStart,
+} from "./editing/stageMeasure";
+export {
+  isStageColour,
+  MAX_STAGE_ACTS,
+  readStageActHeld,
+  readStageRect,
+  STAGE_ACT_BORROWS,
+  STAGE_ACT_STYLES,
+  type StageActBorrow,
+  type StageActDraw,
+  type StageActElementHold,
+  type StageActHeld,
+  type StageActHold,
+  type StageActParams,
+  type StageActReadyEvent,
+  type StageActRect,
+  type StageActResult,
+  type StageActStyle,
+  type StageActTarget,
+  type StageInputEvent,
+} from "./editing/stageAct";
+export { rotateBy, scaleBy, translateBy } from "./editing/transformValues";
 export {
   MAX_SNAPSHOT_CHANNELS,
   MAX_SNAPSHOT_FIELDS,
@@ -225,9 +270,12 @@ export const EDITING_REQUEST_KINDS = [
   "mark-scenes-stale",
   "swap-scenes",
   "live-retime",
+  "rebind-timing",
   "assets-unloaded",
   "text-edit",
   "serve-paused-frames",
+  "stage-measure",
+  "stage-act",
 ] as const;
 export type EditingRequestKind = (typeof EDITING_REQUEST_KINDS)[number];
 
@@ -420,10 +468,14 @@ export interface EditingRequests {
   "mark-scenes-stale": { params: MarkScenesStaleParams; result: { marked: true } };
   "swap-scenes": { params: SwapScenesParams; result: SwapScenesResult };
   "live-retime": { params: LiveRetimeParams; result: { result: LiveRetimeResult } };
+  "rebind-timing": { params: { time: number }; result: { rebound: boolean } };
   "assets-unloaded": { params: NoParams; result: { unloaded: boolean } };
   "text-edit": { params: TextEditParams; result: TextEditResult };
   /** Studio's paused-frame decoding port (`editing/pausedFrames.ts`); false when no runtime can use it. */
   "serve-paused-frames": { params: { channel: MessagePort }; result: { served: boolean } };
+  "stage-measure": { params: StageMeasureParams; result: StageMeasureResult };
+  /** Holds, draws and gives back Studio's stage acts inside the frame (`editing/stageAct.ts`). */
+  "stage-act": { params: StageActParams; result: StageActResult };
 }
 export type EditingParams<K extends EditingRequestKind> = EditingRequests[K]["params"];
 export type EditingResult<K extends EditingRequestKind> = EditingRequests[K]["result"];
@@ -729,12 +781,19 @@ const PARAM_PARSERS: {
   "mark-scenes-stale": parseMarkScenesStale,
   "swap-scenes": parseSwapScenes,
   "live-retime": parseLiveRetime,
+  "rebind-timing": (params) => {
+    if (!isPlainRecord(params) || Object.keys(params).join() !== "time") return null;
+    const { time } = params;
+    return typeof time === "number" && Number.isFinite(time) && time >= 0 ? { time } : null;
+  },
   "assets-unloaded": noParams,
   "text-edit": parseTextEdit,
   "serve-paused-frames": (params) =>
     hasKeys(params, "channel") && params.channel instanceof MessagePort
       ? { channel: params.channel }
       : null,
+  "stage-measure": parseStageMeasureParams,
+  "stage-act": parseStageActParams,
 };
 
 /** Validates one request off the wire. Never throws: anything unusable becomes a typed error. */
@@ -777,6 +836,8 @@ export interface EditingPortClient {
   onGeometry(listener: (event: EditingGeometryEvent) => void): () => void;
   onTextEditEnded(listener: (event: TextEditEndedEvent) => void): () => void;
   onTextEditSelection(listener: (event: TextEditSelectionEvent) => void): () => void;
+  onStageActReady(listener: (event: StageActReadyEvent) => void): () => void;
+  onStageInput(listener: (event: StageInputEvent) => void): () => void;
   /** Rejects every pending request with `disposed` and closes the port. */
   dispose(): void;
 }
@@ -839,6 +900,8 @@ export function createEditingPortClient(options: {
   const geometryListeners = new Set<(event: EditingGeometryEvent) => void>();
   const textEditListeners = new Set<(event: TextEditEndedEvent) => void>();
   const selectionListeners = new Set<(event: TextEditSelectionEvent) => void>();
+  const stageReadyListeners = new Set<(event: StageActReadyEvent) => void>();
+  const stageInputListeners = new Set<(event: StageInputEvent) => void>();
   let watchedGeometry = false;
   let port: MessagePort | null = null;
   let disposed = false;
@@ -867,7 +930,11 @@ export function createEditingPortClient(options: {
     const ended = textEditEndedEvent(data, EDITING_PROTOCOL_VERSION);
     if (ended) return textEditListeners.forEach((listener) => listener(ended));
     const selected = textEditSelectionEvent(data, EDITING_PROTOCOL_VERSION);
-    if (selected) selectionListeners.forEach((listener) => listener(selected));
+    if (selected) return selectionListeners.forEach((listener) => listener(selected));
+    const stageReady = stageActReadyEvent(data, EDITING_PROTOCOL_VERSION);
+    if (stageReady) return stageReadyListeners.forEach((listener) => listener(stageReady));
+    const stageInput = stageInputEvent(data, EDITING_PROTOCOL_VERSION);
+    if (stageInput) stageInputListeners.forEach((listener) => listener(stageInput));
   };
   const onReply = (event: MessageEvent<unknown>) => {
     const data = event.data;
@@ -943,6 +1010,14 @@ export function createEditingPortClient(options: {
       selectionListeners.add(listener);
       return () => selectionListeners.delete(listener);
     },
+    onStageActReady(listener) {
+      stageReadyListeners.add(listener);
+      return () => stageReadyListeners.delete(listener);
+    },
+    onStageInput(listener) {
+      stageInputListeners.add(listener);
+      return () => stageInputListeners.delete(listener);
+    },
     dispose() {
       if (disposed) return;
       disposed = true;
@@ -950,6 +1025,8 @@ export function createEditingPortClient(options: {
       geometryListeners.clear();
       textEditListeners.clear();
       selectionListeners.clear();
+      stageReadyListeners.clear();
+      stageInputListeners.clear();
       host.removeEventListener("message", onWindowMessage);
       if (watchedGeometry) {
         const stop = { kind: "watch-geometry", params: { handles: [] } };

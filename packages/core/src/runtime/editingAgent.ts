@@ -45,6 +45,7 @@ import { patchTweens } from "./editing/patchTween";
 import { preloadMotionPath, restoreAttributesOrRerun, softReload } from "./editing/softReload";
 import { holdScenes, markScenesStale, swapScenes } from "./editing/scenes";
 import { liveRetime } from "./editing/liveRetime";
+import { rebindTiming } from "./editing/rebindTiming";
 import { previewAssetsUnloaded } from "../lottieReadiness";
 import {
   getLogicalOpacity,
@@ -69,6 +70,8 @@ import { setAudioGroupAttribute } from "./editing/setAudioGroupAttribute";
 import { editElement } from "./editing/editElement";
 import { endTextEdit, textEdit } from "./editing/textEdit";
 import { portPausedVideoProvider } from "./editing/pausedFrames";
+import { measureStageDocument } from "./editing/stageMeasure";
+import { endStageAct, stageAct } from "./editing/stageAct";
 
 type Handlers = {
   [K in EditingRequestKind]: (
@@ -248,6 +251,7 @@ const HANDLERS: Handlers = {
   "mark-scenes-stale": markScenesStale,
   "swap-scenes": swapScenes,
   "live-retime": liveRetime,
+  "rebind-timing": rebindTiming,
   "assets-unloaded": () => ({ unloaded: previewAssetsUnloaded(document, window.__hfLottie) }),
   "serve-paused-frames": ({ channel }) => {
     const install = window.__hf?.setPausedVideoFrameProvider;
@@ -259,6 +263,8 @@ const HANDLERS: Handlers = {
     return { served: true };
   },
   "text-edit": (params, port) => textEdit(params, port, EDITING_PROTOCOL_VERSION),
+  "stage-measure": ({ maxItems }) => measureStageDocument(document, maxItems),
+  "stage-act": (params, port) => stageAct(params, port, EDITING_PROTOCOL_VERSION),
 };
 
 function serve(port: MessagePort): void {
@@ -342,6 +348,7 @@ export function installEditingAgent(parent: Window = window.parent): { dispose: 
       listenForKeys(false);
       stopWatchingGeometry();
       endTextEdit();
+      endStageAct();
     },
   };
 }

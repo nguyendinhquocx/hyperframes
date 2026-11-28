@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
+import { STUDIO_PREVIEW_PAGE_DEADLINE_MS } from "@hyperframes/core/studio-preview-mark";
 
 export interface BuildJob {
   kind: "build";
@@ -59,14 +60,16 @@ type Result<J> = J extends BuildJob
       : string;
 
 export class SubCompositionDeadlineError extends Error {
-  constructor(compPath: string) {
+  readonly queued: boolean;
+  constructor(compPath: string, queued = false) {
     super(`${compPath} took too long to build`);
     this.name = "SubCompositionDeadlineError";
+    this.queued = queued;
   }
 }
 
 export const SUB_COMPOSITION_DEADLINE_MS = 30_000;
-export const ROOT_PREVIEW_DEADLINE_MS = 120_000;
+export const ROOT_PREVIEW_DEADLINE_MS = STUDIO_PREVIEW_PAGE_DEADLINE_MS;
 
 interface Pending {
   job: SubCompositionJob;
@@ -165,7 +168,7 @@ export function runOffThread<J extends SubCompositionJob>(
       () => {
         const wasRunning = running === id;
         untrack(id);
-        reject(new SubCompositionDeadlineError(compPath));
+        reject(new SubCompositionDeadlineError(compPath, !wasRunning));
         if (wasRunning && worker) replace(worker);
       },
       Math.max(0, deadline - performance.now()),

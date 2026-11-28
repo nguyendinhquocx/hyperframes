@@ -5,6 +5,7 @@ export * from "./ui";
 export { EditorShell } from "./components/EditorShell";
 export type { EditorShellProps } from "./components/EditorShell";
 export { NLEPreview } from "./components/nle/NLEPreview";
+export { primeFrameToken } from "./player/lib/frameToken";
 export {
   DEFAULT_SHORTCUT_SECTIONS,
   DEFAULT_STUDIO_KEYS,
@@ -19,6 +20,7 @@ export type { Combo } from "@hyperframes/core/key-combo";
 export type { StudioKeyAction, StudioKeys } from "./player/components/studioShortcuts";
 export { ShortcutsButton } from "./player/components/ShortcutsPanel";
 export { dispatchLinkShortcut } from "./hooks/linkShortcuts";
+export { onSealedCanvasCancel } from "./components/editor/useSealedCanvasKeys";
 export type { LinkShortcutCallbacks } from "./hooks/linkShortcuts";
 export type { ShortcutsButtonProps } from "./player/components/ShortcutsPanel";
 export type { ShortcutHint, ShortcutSection } from "./player/components/studioShortcuts";
@@ -46,6 +48,7 @@ export {
 } from "./player";
 export { usePreviewIframeStore } from "./player/store/previewIframeStore";
 export {
+  frameStyleValue,
   previewAuthoredStyles,
   previewComputedStylesOfEvery,
   previewDocumentCopy,
@@ -75,6 +78,7 @@ export {
   type StageTextStart,
 } from "./player/lib/previewStageMeasure";
 export {
+  capturePreviewGhosts,
   holdPreviewStage,
   onPreviewStageActReady,
   onPreviewStageInput,
@@ -83,6 +87,7 @@ export {
   restorePreviewStage,
   STAGE_ACT_TIMEOUT_MS,
   type StageActDraw,
+  type StageActGhost,
   type StageActHeld,
   type StageActHold,
   type StageActTarget,
@@ -234,6 +239,8 @@ export type {
 export { flushStudioPendingEdits } from "./utils/studioPendingEdits";
 export { revertNewestStudioPendingEdit } from "./utils/studioPendingEdits";
 export { cancelNewestStudioWaitingPress } from "./utils/studioPendingEdits";
+export { setStudioTextEditAway } from "./hooks/textEditAway";
+export type { StudioTextEditAway } from "./hooks/textEditAway";
 export type { StudioPendingEditsDrainResult } from "./utils/studioPendingEdits";
 export type {
   CanEditTimelineElement,

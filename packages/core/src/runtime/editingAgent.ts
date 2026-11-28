@@ -1,18 +1,21 @@
 /**
  * The runtime's end of the editing channel (wire types in `editingPort.ts`).
  *
- * Each connect from `window.parent` gets a fresh port, so only the parent holds a channel and a
- * remounted client is served too; any other connect, or any in a page served to another site, is
- * ignored. Earlier ports stay open: a client may take any of them; a disposed one closes its own.
+ * Each connect from `window.parent` carries a port the parent made, and the runtime serves it, so
+ * only the parent holds the other end and a remounted client is served too. The connect ends at
+ * the runtime's listener, which is added when the runtime first evaluates; one that is not served
+ * (another version, or a page served to another site) has its port closed.
  * Requests on the port are validated; a bad one gets a typed error reply, never a throw.
  */
 import { swallow } from "./diagnostics";
+import { wallClearTimeout, wallSetTimeout } from "./wallClock";
 import {
   EDITING_CONNECT,
-  EDITING_PORT,
   EDITING_PROTOCOL_VERSION,
   EDITING_REQUEST_KINDS,
+  EDITING_REQUEST_TIMEOUT_MS,
   isPlainRecord,
+  type FramePresentedParams,
   parseEditingRequest,
   type EditingKeyMessage,
   type EditingParams,
@@ -33,6 +36,7 @@ import { elementGeometry } from "./editingGeometry";
 import { pointerTargetsAt } from "./editingTargets";
 import { layersOf } from "./editingLayers";
 import { drawDrafts } from "./editingDraft";
+import { clearDragChrome } from "./editing/dragChrome";
 import { stopWatchingGeometry, watchGeometry } from "./editing/watchGeometry";
 import { maxZIndex } from "./editing/maxZIndex";
 import { gestureBase, gestureStart } from "./editingGestureStart";
@@ -70,6 +74,15 @@ import { setAudioGroupAttribute } from "./editing/setAudioGroupAttribute";
 import { editElement } from "./editing/editElement";
 import { endTextEdit, textEdit } from "./editing/textEdit";
 import { portPausedVideoProvider } from "./editing/pausedFrames";
+import { armCanvasKeys, resetCanvasKeys, resolveCanvasKeyAction } from "./editing/canvasKeys";
+import {
+  canServePorts,
+  closePort,
+  onPortMessage,
+  portMap,
+  postOnPort,
+  endMessageAndTakePorts,
+} from "./runtimePort";
 import { measureStageDocument } from "./editing/stageMeasure";
 import { endStageAct, stageAct } from "./editing/stageAct";
 
@@ -110,7 +123,7 @@ function watchConsoleErrors(): string[] {
   return seen;
 }
 
-const keyWatches = new Map<MessagePort, { combos: Combo[]; down: Set<string> }>();
+const keyWatches = portMap<{ combos: Combo[]; down: Set<string> }>();
 
 function forwardKey(port: MessagePort, e: KeyboardEvent): void {
   const { type, key, code, altKey, ctrlKey, metaKey, shiftKey, repeat } = e;
@@ -128,23 +141,23 @@ function forwardKey(port: MessagePort, e: KeyboardEvent): void {
       repeat,
     },
   };
-  port.postMessage(message);
+  postOnPort(port, message);
 }
 
 function onWatchedKeyDown(e: KeyboardEvent): void {
   if (e.defaultPrevented || shouldIgnorePlaybackShortcutTarget(e.target)) return;
-  for (const [port, watch] of keyWatches) {
-    if (!watch.combos.some((combo) => matchCombo(e, combo))) continue;
+  keyWatches.forEach((watch, port) => {
+    if (!watch.combos.some((combo) => matchCombo(e, combo))) return;
     e.preventDefault();
     watch.down.add(e.code || e.key);
     forwardKey(port, e);
-  }
+  });
 }
 
 function onWatchedKeyUp(e: KeyboardEvent): void {
-  for (const [port, watch] of keyWatches) {
+  keyWatches.forEach((watch, port) => {
     if (watch.down.delete(e.code || e.key)) forwardKey(port, e);
-  }
+  });
 }
 
 function listenForKeys(on: boolean): void {
@@ -163,7 +176,7 @@ function watchKeys(port: MessagePort, combos: string[]): { watching: number } {
     const down = keyWatches.get(port)?.down ?? new Set<string>();
     keyWatches.set(port, { combos: combos.map((text) => parseCombo(text)!), down });
   }
-  listenForKeys(keyWatches.size > 0);
+  listenForKeys(keyWatches.size() > 0);
   return { watching: combos.length };
 }
 
@@ -176,6 +189,70 @@ function stylesOf(element: Element, properties: readonly string[]): Record<strin
     if (value) styles[name] = value;
   }
   return styles;
+}
+
+const VIDEO_SETTLE_EVENTS = ["seeked", "error", "abort", "emptied"] as const;
+// Without a waitMs, answers before the client's default timeout gives up.
+const FRAME_PRESENTED_LIMIT_MS = EDITING_REQUEST_TIMEOUT_MS - 1_000;
+const pendingPresentedWaits = new Set<() => void>();
+
+type Cleanups = Array<() => void>;
+
+function whenVideosSettle(videos: HTMLVideoElement[], cleanups: Cleanups, settled: () => void) {
+  const waiting = new Set(videos);
+  const check = () => {
+    if (waiting.size === 0) return;
+    for (const video of waiting) if (!video.seeking || !video.isConnected) waiting.delete(video);
+    if (waiting.size === 0) settled();
+  };
+  for (const video of videos) {
+    for (const name of VIDEO_SETTLE_EVENTS) video.addEventListener(name, check, { once: true });
+    cleanups.push(() => {
+      for (const name of VIDEO_SETTLE_EVENTS) video.removeEventListener(name, check);
+    });
+  }
+  if (typeof MutationObserver === "function" && document.documentElement) {
+    const observer = new MutationObserver(check);
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    cleanups.push(() => observer.disconnect());
+  }
+  check();
+}
+
+function whenTwoFramesPaint(cleanups: Cleanups, painted: () => void) {
+  if (typeof window.requestAnimationFrame !== "function") return painted();
+  let frame = window.requestAnimationFrame(() => {
+    frame = window.requestAnimationFrame(painted);
+  });
+  cleanups.push(() => window.cancelAnimationFrame(frame));
+}
+
+function waitForFramePresented({
+  waitMs = FRAME_PRESENTED_LIMIT_MS,
+}: FramePresentedParams): Promise<{
+  presented: boolean;
+}> {
+  return new Promise((resolve) => {
+    const cleanups: Cleanups = [];
+    let done = false;
+    const finish = (presented: boolean) => {
+      if (done) return;
+      done = true;
+      for (const clean of cleanups.splice(0)) clean();
+      pendingPresentedWaits.delete(expire);
+      resolve({ presented });
+    };
+    const expire = () => finish(false);
+    pendingPresentedWaits.add(expire);
+    const timer = wallSetTimeout(expire, waitMs);
+    cleanups.push(() => wallClearTimeout(timer));
+    const seeking = Array.from(document.querySelectorAll("video")).filter(
+      (video) => video.seeking && video.isConnected,
+    );
+    const paint = () => whenTwoFramesPaint(cleanups, () => finish(true));
+    if (seeking.length === 0) return paint();
+    whenVideosSettle(seeking, cleanups, paint);
+  });
 }
 
 const HANDLERS: Handlers = {
@@ -217,7 +294,10 @@ const HANDLERS: Handlers = {
   query: ({ selector }) => queryElements(selector),
   geometry: ({ handles, children }) => elementGeometry(handles, children),
   layers: ({ group, offset }) => layersOf(group, offset),
-  draft: ({ drafts }) => ({ ...drawDrafts(drafts), gsapSetTakesDrafts: true as const }),
+  draft: ({ drafts, chrome }) => ({
+    ...drawDrafts(drafts, chrome),
+    gsapSetTakesDrafts: true as const,
+  }),
   "gesture-start": ({ handles }) => gestureStart(handles),
   "gesture-base": ({ handles }) => ({ elements: handles.map(gestureBase) }),
   "console-errors": ({ from }) => {
@@ -263,6 +343,9 @@ const HANDLERS: Handlers = {
     return { served: true };
   },
   "text-edit": (params, port) => textEdit(params, port, EDITING_PROTOCOL_VERSION),
+  "frame-presented": waitForFramePresented,
+  "arm-canvas-keys": (params, port) => armCanvasKeys(port, params, EDITING_PROTOCOL_VERSION),
+  "resolve-canvas-key-action": resolveCanvasKeyAction,
   "stage-measure": ({ maxItems }) => measureStageDocument(document, maxItems),
   "stage-act": (params, port) => stageAct(params, port, EDITING_PROTOCOL_VERSION),
 };
@@ -270,15 +353,15 @@ const HANDLERS: Handlers = {
 function serve(port: MessagePort): void {
   const reply = (message: EditingReply) => {
     try {
-      port.postMessage(message);
+      postOnPort(port, message);
     } catch (err) {
       // A result that cannot be cloned still owes the parent an answer.
       if (message.ok) reply(failure(message.id, err));
       else swallow("editingAgent.reply", err);
     }
   };
-  port.onmessage = (event: MessageEvent<unknown>) => {
-    const request = parseEditingRequest(event.data);
+  onPortMessage(port, (data) => {
+    const request = parseEditingRequest(data);
     if (!request.ok) {
       reply({
         v: EDITING_PROTOCOL_VERSION,
@@ -295,7 +378,7 @@ function serve(port: MessagePort): void {
         (result) => reply({ v: EDITING_PROTOCOL_VERSION, id: request.id, ok: true, result }),
         (err: unknown) => reply(failure(request.id, err)),
       );
-  };
+  });
 }
 
 function failure(id: number, err: unknown): EditingReply {
@@ -308,39 +391,64 @@ function failure(id: number, err: unknown): EditingReply {
   };
 }
 
-export function installEditingAgent(parent: Window = window.parent): { dispose: () => void } {
-  const ports = new Set<MessagePort>();
+const parentAtLoad = typeof window !== "undefined" ? window.parent : undefined;
+
+function isConnectRequest(event: MessageEvent<unknown>, parent: Window): boolean {
+  // A top-level page is its own parent, so a self-post would pass the source check.
+  if (parent === window || event.source !== parent) return false;
+  const data = event.data;
+  return isPlainRecord(data) && data.source === "hf-parent" && data.type === EDITING_CONNECT;
+}
+
+function listenForConnects(parent: Window, take: (port: MessagePort) => void): () => void {
   const onMessage = (event: MessageEvent<unknown>) => {
-    // A top-level page is its own parent, so a self-post would pass the source check.
-    if (parent === window || event.source !== parent) return;
-    const data = event.data;
-    if (!isPlainRecord(data) || data.source !== "hf-parent" || data.type !== EDITING_CONNECT)
-      return;
-    if (data.v !== EDITING_PROTOCOL_VERSION || !markedForStudio(document)) return;
-    const channel = new MessageChannel();
-    const port = channel.port1;
-    ports.add(port);
+    if (!isConnectRequest(event, parent)) return;
+    const ports = endMessageAndTakePorts(event);
+    const version = (event.data as { v?: unknown }).v;
+    const served =
+      ports.length === 1 &&
+      version === EDITING_PROTOCOL_VERSION &&
+      canServePorts(event) &&
+      markedForStudio(document);
+    if (served) return take(ports[0]!);
+    for (let i = 0; i < ports.length; i += 1) closePort(ports[i]!);
+  };
+  window.addEventListener("message", onMessage, true);
+  return () => window.removeEventListener("message", onMessage, true);
+}
+
+const waiting = portMap<true>();
+let takeAtLoad: (port: MessagePort) => void = (port) => waiting.set(port, true);
+let stopAtLoad: (() => void) | null = null;
+
+export function listenForEditingConnect(): void {
+  if (!parentAtLoad || stopAtLoad) return;
+  stopAtLoad = listenForConnects(parentAtLoad, (port) => takeAtLoad(port));
+}
+
+export function installEditingAgent(parent?: Window): {
+  dispose: () => void;
+} {
+  const ports = portMap<true>();
+  const take = (port: MessagePort) => {
+    ports.set(port, true);
     serve(port);
-    try {
-      // "*" as every runtime post does (bridge.ts): the frame is not told its parent's origin.
-      parent.postMessage(
-        { source: "hf-preview", type: EDITING_PORT, v: EDITING_PROTOCOL_VERSION },
-        "*",
-        [channel.port2],
-      );
-    } catch (err) {
-      swallow("editingAgent.handoff", err);
-      port.close();
-      ports.delete(port);
-      return;
-    }
     preloadMotionPath();
   };
-  window.addEventListener("message", onMessage);
+  let stop: () => void;
+  if (!parent && stopAtLoad) {
+    stop = stopAtLoad;
+    stopAtLoad = null;
+    takeAtLoad = take;
+    waiting.forEach((_, port) => take(port));
+    waiting.clear();
+  } else {
+    stop = listenForConnects(parent ?? parentAtLoad ?? window.parent, take);
+  }
   return {
     dispose() {
-      window.removeEventListener("message", onMessage);
-      for (const port of ports) port.close();
+      stop();
+      ports.forEach((_, port) => closePort(port));
       ports.clear();
       consoleWatch?.stop();
       consoleWatch = null;
@@ -348,7 +456,10 @@ export function installEditingAgent(parent: Window = window.parent): { dispose: 
       listenForKeys(false);
       stopWatchingGeometry();
       endTextEdit();
+      for (const expire of [...pendingPresentedWaits]) expire();
+      resetCanvasKeys(true);
       endStageAct();
+      clearDragChrome();
     },
   };
 }

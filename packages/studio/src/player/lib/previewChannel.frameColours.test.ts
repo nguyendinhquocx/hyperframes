@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import type { TextEditSelectionEvent } from "@hyperframes/core/runtime/editing-port";
 
 const fake = vi.hoisted(() => ({
@@ -17,22 +17,13 @@ vi.mock("@hyperframes/core/runtime/editing-port", async (importOriginal) => ({
   }),
 }));
 
-const { previewEditingClient, retirePreviewEditingClient } = await import("./previewChannel");
+const { frameStyleValue, previewEditingClient, retirePreviewEditingClient } =
+  await import("./previewChannel");
 
 const BEACON = "url(https://probe.invalid/beacon)";
 const HANDLE = "0123456789abcdef:1";
 
-// happy-dom's CSS.supports says yes to any value; Chrome's says no to a url() as a colour, as
-// InlineTextToolbar.browser.test.ts checks through this same filter.
-beforeEach(() => {
-  vi.stubGlobal("CSS", {
-    supports: (property: string, value?: string) =>
-      property === "color" && !/url\(|;/i.test(value ?? ""),
-  });
-});
-
 afterEach(() => {
-  vi.unstubAllGlobals();
   fake.listeners.clear();
   document.body.innerHTML = "";
 });
@@ -74,4 +65,32 @@ it("hands Studio a sealed frame's selection colours only when they are colours",
   expect(event?.selection?.styles).toEqual({ "font-weight": "700" });
   expect(event?.selection?.colours).toEqual(["rgb(4, 5, 6)"]);
   expect(event?.selection?.painted).toBeNull();
+});
+
+it("refuses a frame colour that defers to Studio's page or spells a load", () => {
+  const hidden = [
+    "var(--none, url(https://probe.invalid/a))",
+    "env(--none, url(https://probe.invalid/b))",
+    "attr(data-none type(<color>), url(https://probe.invalid/c))",
+    "\\75 rl(https://probe.invalid/d)",
+    "u\\72l(https://probe.invalid/e)",
+    "rgb(1, 2, 3) /* url(https://probe.invalid/f) */",
+    "image-set(url(https://probe.invalid/g) 1x)",
+  ];
+  for (const value of hidden) {
+    expect(frameStyleValue("color", value)).toBeNull();
+    expect(frameStyleValue("background-color", value)).toBeNull();
+  }
+  const caret = { left: 1, top: 2, height: 20, color: hidden[0]!, viewportWidth: 1600 };
+  expect(received({ handle: HANDLE, selection: null, caret })[0]?.caret).toBeNull();
+  expect(frameStyleValue("color", "rgb(1, 2, 3)")).toBe("rgb(1, 2, 3)");
+});
+
+it("keeps a frame's style value only when it is a value of the property it answers for", () => {
+  expect(frameStyleValue("border-top-width", "3px")).toBe("3px");
+  expect(frameStyleValue("border-top-width", "url(/api/x)")).toBeNull();
+  expect(frameStyleValue("border-top-style", "dashed;color:red")).toBeNull();
+  expect(frameStyleValue("background-color", BEACON)).toBeNull();
+  expect(frameStyleValue("color", 7)).toBeNull();
+  expect(frameStyleValue("--accent", BEACON)).toBeNull();
 });

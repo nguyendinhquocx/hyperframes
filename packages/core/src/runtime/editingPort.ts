@@ -33,6 +33,7 @@ import type { EditingLayer, EditingStackingSibling } from "./editingLayers";
 import { parseGsapSet, type GsapSetParams } from "./editing/gsapSet";
 import { parsePatchTweensRequest, type PatchTweensParams } from "./editing/patchTween";
 import { parseDraftEnd, type EditingDraftEnd, type EditingDraftReply } from "./editingDraftEnd";
+import { parseDragChrome, type EditingDragChrome } from "./editing/dragChrome";
 import {
   parseRestoreAttributesRerun,
   parseSoftReload,
@@ -105,13 +106,25 @@ import {
 } from "./editing/stageAct";
 import {
   parseTextEdit,
+  textEditAwayEvent,
   textEditEndedEvent,
   textEditSelectionEvent,
+  type TextEditAwayEvent,
   type TextEditEndedEvent,
   type TextEditSelectionEvent,
   type TextEditParams,
   type TextEditResult,
 } from "./editing/textEdit";
+import {
+  canvasKeyActionEvent,
+  parseArmCanvasKeys,
+  parseResolveCanvasKeyAction,
+  type ArmCanvasKeysParams,
+  type ArmCanvasKeysResult,
+  type CanvasKeyActionEvent,
+  type ResolveCanvasKeyActionParams,
+  type ResolveCanvasKeyActionResult,
+} from "./editing/canvasKeys";
 
 export {
   buildStableSelector,
@@ -156,6 +169,13 @@ export {
 export type { EditingGestureBase, EditingGestureStart } from "./editingGestureStart";
 export { MAX_CAPTION_TRANSFORM } from "./editing/captionTransform";
 export { MAX_EDIT_ENTRIES } from "./editing/editElement";
+export {
+  MAX_DRAG_CHROME_BYTES,
+  MAX_DRAG_CHROME_NODES,
+  parseDragChrome,
+  type EditingDragChrome,
+  type EditingDragChromeNode,
+} from "./editing/dragChrome";
 export { MAX_FONT_FACES } from "./editing/textStyleReads";
 export {
   MAX_STAGE_CLIP_KEYS,
@@ -175,6 +195,7 @@ export {
   type StageActBorrow,
   type StageActDraw,
   type StageActElementHold,
+  type StageActGhostHold,
   type StageActHeld,
   type StageActHold,
   type StageActParams,
@@ -185,6 +206,7 @@ export {
   type StageActTarget,
   type StageInputEvent,
 } from "./editing/stageAct";
+export { MAX_STAGE_GHOST_MARKUP, type StageActGhost } from "./editing/stageGhost";
 export { rotateBy, scaleBy, translateBy } from "./editing/transformValues";
 export {
   MAX_SNAPSHOT_CHANNELS,
@@ -219,11 +241,9 @@ export {
   type LayerKind,
 } from "./editingLayers";
 
-export const EDITING_PROTOCOL_VERSION = 1 as const;
-/** Parent to frame, on the window: asks the runtime for the port. */
+export const EDITING_PROTOCOL_VERSION = 2 as const;
+/** Parent to frame, on the window: carries the runtime's port in its transfer list. */
 export const EDITING_CONNECT = "editing-connect";
-/** Frame to parent, on the window: carries the port in its transfer list. */
-export const EDITING_PORT = "editing-port";
 
 export const EDITING_REQUEST_KINDS = [
   "hello",
@@ -274,6 +294,9 @@ export const EDITING_REQUEST_KINDS = [
   "assets-unloaded",
   "text-edit",
   "serve-paused-frames",
+  "frame-presented",
+  "arm-canvas-keys",
+  "resolve-canvas-key-action",
   "stage-measure",
   "stage-act",
 ] as const;
@@ -340,6 +363,8 @@ export type EditingDraft =
   | EditingDraftEnd;
 
 type NoParams = Record<string, never>;
+export type FramePresentedParams = { waitMs?: number };
+const MAX_FRAME_PRESENTED_WAIT_MS = 15_000;
 export interface EditingRequests {
   hello: {
     params: NoParams;
@@ -410,9 +435,9 @@ export interface EditingRequests {
     params: { group?: EditingElementHandle; offset?: number };
     result: { layers: EditingLayer[]; truncated: boolean; missingGroup: boolean };
   };
-  /** Gesture drafts in order, up to MAX_DESCRIBE_HANDLES; `drawn` counts the elements still here. */
+  /** Gesture drafts in order, up to MAX_DESCRIBE_HANDLES, and the chrome painted with them (null clears it). */
   draft: {
-    params: { drafts: EditingDraft[] };
+    params: { drafts: EditingDraft[]; chrome?: EditingDragChrome };
     result: EditingDraftReply & { gsapSetTakesDrafts?: true };
   };
   "gesture-start": {
@@ -473,6 +498,12 @@ export interface EditingRequests {
   "text-edit": { params: TextEditParams; result: TextEditResult };
   /** Studio's paused-frame decoding port (`editing/pausedFrames.ts`); false when no runtime can use it. */
   "serve-paused-frames": { params: { channel: MessagePort }; result: { served: boolean } };
+  "frame-presented": { params: FramePresentedParams; result: { presented: boolean } };
+  "arm-canvas-keys": { params: ArmCanvasKeysParams; result: ArmCanvasKeysResult };
+  "resolve-canvas-key-action": {
+    params: ResolveCanvasKeyActionParams;
+    result: ResolveCanvasKeyActionResult;
+  };
   "stage-measure": { params: StageMeasureParams; result: StageMeasureResult };
   /** Holds, draws and gives back Studio's stage acts inside the frame (`editing/stageAct.ts`). */
   "stage-act": { params: StageActParams; result: StageActResult };
@@ -516,6 +547,23 @@ const hasKeys = (params: unknown, keys: string): params is Record<string, unknow
 
 const noParams = (params: unknown): NoParams | null =>
   params === undefined || (isPlainRecord(params) && Object.keys(params).length === 0) ? {} : null;
+
+function parseFramePresented(params: unknown): FramePresentedParams | null {
+  if (noParams(params)) return {};
+  if (!hasKeys(params, "waitMs")) return null;
+  const { waitMs } = params;
+  const bounded =
+    typeof waitMs === "number" &&
+    Number.isFinite(waitMs) &&
+    waitMs > 0 &&
+    waitMs <= MAX_FRAME_PRESENTED_WAIT_MS;
+  return bounded ? { waitMs } : null;
+}
+
+const clientWaitPastFrameDeadline = (kind: EditingRequestKind, params: unknown): number =>
+  kind === "frame-presented" && isPlainRecord(params) && typeof params.waitMs === "number"
+    ? params.waitMs + 1_000
+    : 0;
 
 const isSelector = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0 && value.length <= MAX_SELECTOR_LENGTH;
@@ -663,14 +711,22 @@ function gsapSetWithDrafts(params: unknown): GsapSetParams | null {
   if (!isPlainRecord(params) || !("drafts" in params)) return parseGsapSet(params);
   const { drafts, ...set } = params;
   const parsed = parseGsapSet(set);
-  const drawn = draftList({ drafts });
+  const drawn = draftsOnly({ drafts });
   return parsed && drawn ? { ...parsed, drafts: drawn.drafts } : null;
 }
 
 function draftList(params: unknown): EditingParams<"draft"> | null {
+  if (!isPlainRecord(params) || !("chrome" in params)) return draftsOnly(params);
+  const { chrome, ...rest } = params;
+  const drawn = draftsOnly(rest, true);
+  const parsed = parseDragChrome(chrome);
+  return drawn && parsed !== undefined ? { ...drawn, chrome: parsed } : null;
+}
+
+function draftsOnly(params: unknown, chromeOnly = false): { drafts: EditingDraft[] } | null {
   if (!hasKeys(params, "drafts") || !Array.isArray(params.drafts)) return null;
   const { drafts } = params;
-  if (!drafts.length || drafts.length > MAX_DESCRIBE_HANDLES) return null;
+  if ((!drafts.length && !chromeOnly) || drafts.length > MAX_DESCRIBE_HANDLES) return null;
   const parsed = drafts.map(draftEntry);
   return parsed.includes(null) ? null : { drafts: parsed as EditingDraft[] };
 }
@@ -792,9 +848,25 @@ const PARAM_PARSERS: {
     hasKeys(params, "channel") && params.channel instanceof MessagePort
       ? { channel: params.channel }
       : null,
+  "frame-presented": parseFramePresented,
+  "arm-canvas-keys": parseArmCanvasKeys,
+  "resolve-canvas-key-action": parseResolveCanvasKeyAction,
   "stage-measure": parseStageMeasureParams,
   "stage-act": parseStageActParams,
 };
+
+/** Hands a push to its listeners when `parse` reads it as their event; false when it is not one. */
+function pushRoute<E>(
+  listeners: Set<(event: E) => void>,
+  parse: (data: Record<string, unknown>) => E | null | false | undefined,
+): (data: Record<string, unknown>) => boolean {
+  return (data) => {
+    const event = parse(data);
+    if (!event) return false;
+    listeners.forEach((listener) => listener(event));
+    return true;
+  };
+}
 
 /** Validates one request off the wire. Never throws: anything unusable becomes a typed error. */
 export function parseEditingRequest(data: unknown): ParsedEditingRequest {
@@ -824,7 +896,7 @@ export class EditingPortError extends Error {
 }
 
 export interface EditingPortClient {
-  /** Settles when the frame's runtime has handed over its port. */
+  /** Settles when the frame's runtime serves the port this client sent it. */
   readonly ready: Promise<void>;
   request<K extends EditingRequestKind>(
     kind: K,
@@ -835,7 +907,9 @@ export interface EditingPortClient {
   onKey(listener: (key: EditingKeyEvent) => void): () => void;
   onGeometry(listener: (event: EditingGeometryEvent) => void): () => void;
   onTextEditEnded(listener: (event: TextEditEndedEvent) => void): () => void;
+  onTextEditAway(listener: (event: TextEditAwayEvent) => void): () => void;
   onTextEditSelection(listener: (event: TextEditSelectionEvent) => void): () => void;
+  onCanvasKeyAction(listener: (event: CanvasKeyActionEvent) => void): () => void;
   onStageActReady(listener: (event: StageActReadyEvent) => void): () => void;
   onStageInput(listener: (event: StageInputEvent) => void): () => void;
   /** Rejects every pending request with `disposed` and closes the port. */
@@ -858,25 +932,17 @@ function replyOutcome(data: Record<string, unknown>): Outcome {
   return { error: new EditingPortError(error.code as EditingErrorCode, message) };
 }
 
-/** The port this frame handed over, "ready" when its runtime came up, else null. */
-function readHandoff(
-  event: MessageEvent<unknown>,
-  frame: Window | null,
-): MessagePort | "ready" | null {
+/** True for the frame's own note that its runtime came up. */
+function runtimeCameUp(event: MessageEvent<unknown>, frame: Window | null): boolean {
   const data = event.data;
-  if (!frame || event.source !== frame || !isPlainRecord(data) || data.source !== "hf-preview") {
-    return null;
-  }
-  if (data.type === "ready") return "ready";
-  return data.type === EDITING_PORT && data.v === EDITING_PROTOCOL_VERSION
-    ? onlyPort(event.ports)
-    : null;
+  return (
+    !!frame &&
+    event.source === frame &&
+    isPlainRecord(data) &&
+    data.source === "hf-preview" &&
+    data.type === "ready"
+  );
 }
-
-const onlyPort = (ports: readonly MessagePort[]): MessagePort | null =>
-  ports.length === 1 ? (ports[0] ?? null) : null;
-
-const portsTaken = new WeakSet<MessagePort>();
 
 type Pending = {
   resolve: (result: unknown) => void;
@@ -885,9 +951,9 @@ type Pending = {
 };
 
 /**
- * The parent's end of the editing channel for one preview frame load. Asks for
- * the port at once and again on the runtime's `ready`, and takes the first port
- * that frame sends. Replies are data from the frame, so callers validate results.
+ * The parent's end of the editing channel for one preview frame load. Makes the channel and sends
+ * the frame one end, at once and again on the runtime's `ready`; it never takes a port from the
+ * frame. Replies are data from the frame, so callers validate results.
  */
 export function createEditingPortClient(options: {
   iframe: HTMLIFrameElement;
@@ -899,7 +965,9 @@ export function createEditingPortClient(options: {
   const keyListeners = new Set<(key: EditingKeyEvent) => void>();
   const geometryListeners = new Set<(event: EditingGeometryEvent) => void>();
   const textEditListeners = new Set<(event: TextEditEndedEvent) => void>();
+  const awayListeners = new Set<(event: TextEditAwayEvent) => void>();
   const selectionListeners = new Set<(event: TextEditSelectionEvent) => void>();
+  const canvasKeyActionListeners = new Set<(event: CanvasKeyActionEvent) => void>();
   const stageReadyListeners = new Set<(event: StageActReadyEvent) => void>();
   const stageInputListeners = new Set<(event: StageInputEvent) => void>();
   let watchedGeometry = false;
@@ -922,45 +990,53 @@ export function createEditingPortClient(options: {
     if ("error" in outcome) entry.reject(outcome.error);
     else entry.resolve(outcome.result);
   };
-  const onPush = (data: Record<string, unknown>) => {
-    const key = data.v === EDITING_PROTOCOL_VERSION && data.event === "key" && keyEvent(data.key);
-    if (key) return keyListeners.forEach((listener) => listener(key));
-    const geometry = geometryEvent(data, EDITING_PROTOCOL_VERSION);
-    if (geometry) return geometryListeners.forEach((listener) => listener(geometry));
-    const ended = textEditEndedEvent(data, EDITING_PROTOCOL_VERSION);
-    if (ended) return textEditListeners.forEach((listener) => listener(ended));
-    const selected = textEditSelectionEvent(data, EDITING_PROTOCOL_VERSION);
-    if (selected) return selectionListeners.forEach((listener) => listener(selected));
-    const stageReady = stageActReadyEvent(data, EDITING_PROTOCOL_VERSION);
-    if (stageReady) return stageReadyListeners.forEach((listener) => listener(stageReady));
-    const stageInput = stageInputEvent(data, EDITING_PROTOCOL_VERSION);
-    if (stageInput) stageInputListeners.forEach((listener) => listener(stageInput));
-  };
+  const v = EDITING_PROTOCOL_VERSION;
+  const pushRoutes = [
+    pushRoute(keyListeners, (d) => d.v === v && d.event === "key" && keyEvent(d.key)),
+    pushRoute(geometryListeners, (d) => geometryEvent(d, v)),
+    pushRoute(textEditListeners, (d) => textEditEndedEvent(d, v)),
+    pushRoute(awayListeners, (d) => textEditAwayEvent(d, v)),
+    pushRoute(selectionListeners, (d) => textEditSelectionEvent(d, v)),
+    pushRoute(canvasKeyActionListeners, (d) => canvasKeyActionEvent(d, v)),
+    pushRoute(stageReadyListeners, (d) => stageActReadyEvent(d, v)),
+    pushRoute(stageInputListeners, (d) => stageInputEvent(d, v)),
+  ];
+  const onPush = (data: Record<string, unknown>) => void pushRoutes.some((route) => route(data));
   const onReply = (event: MessageEvent<unknown>) => {
     const data = event.data;
     if (!isPlainRecord(data)) return;
     if (typeof data.id === "number") return settle(data.id, replyOutcome(data));
     onPush(data);
   };
+  let offered: MessagePort | null = null;
   const connect = () => {
+    if (port || disposed) return;
+    offered?.close();
+    const { port1, port2 } = new MessageChannel();
+    offered = port1;
+    port1.onmessage = (event: MessageEvent<unknown>) => {
+      if (port === port1) return onReply(event);
+      const data = event.data;
+      if (port || port1 !== offered || !isPlainRecord(data)) return;
+      if (data.v !== EDITING_PROTOCOL_VERSION || data.ok !== true) return;
+      port = port1;
+      host.removeEventListener("message", onWindowMessage);
+      resolveReady();
+    };
     try {
       iframe.contentWindow?.postMessage(
         { source: "hf-parent", type: EDITING_CONNECT, v: EDITING_PROTOCOL_VERSION },
         "*",
+        [port2],
       );
+      // Waits in the port until the runtime serves it; the reply is what makes this client ready.
+      port1.postMessage({ v: EDITING_PROTOCOL_VERSION, id: ++lastId, kind: "hello", params: {} });
     } catch {
       // The frame is mid-navigation; its runtime's `ready` asks again.
     }
   };
   const onWindowMessage = (event: MessageEvent<unknown>) => {
-    const handoff = readHandoff(event, iframe.contentWindow);
-    if (handoff === "ready") return connect();
-    if (!handoff || portsTaken.has(handoff)) return;
-    portsTaken.add(handoff);
-    port = handoff;
-    host.removeEventListener("message", onWindowMessage);
-    port.onmessage = onReply;
-    resolveReady();
+    if (runtimeCameUp(event, iframe.contentWindow)) connect();
   };
   host.addEventListener("message", onWindowMessage);
   connect();
@@ -971,7 +1047,8 @@ export function createEditingPortClient(options: {
       if (disposed) return Promise.reject(new EditingPortError("disposed", "client disposed"));
       const id = ++lastId;
       if (kind === "watch-geometry") watchedGeometry = true;
-      const limit = requestOptions?.timeoutMs ?? timeoutMs;
+      const limit =
+        requestOptions?.timeoutMs ?? Math.max(timeoutMs, clientWaitPastFrameDeadline(kind, params));
       const result = new Promise<unknown>((resolve, reject) => {
         const timer = wallSetTimeout(
           () => settle(id, { error: new EditingPortError("timeout", `${kind} timed out`) }),
@@ -1006,9 +1083,17 @@ export function createEditingPortClient(options: {
       textEditListeners.add(listener);
       return () => textEditListeners.delete(listener);
     },
+    onTextEditAway(listener) {
+      awayListeners.add(listener);
+      return () => awayListeners.delete(listener);
+    },
     onTextEditSelection(listener) {
       selectionListeners.add(listener);
       return () => selectionListeners.delete(listener);
+    },
+    onCanvasKeyAction(listener) {
+      canvasKeyActionListeners.add(listener);
+      return () => canvasKeyActionListeners.delete(listener);
     },
     onStageActReady(listener) {
       stageReadyListeners.add(listener);
@@ -1024,7 +1109,9 @@ export function createEditingPortClient(options: {
       keyListeners.clear();
       geometryListeners.clear();
       textEditListeners.clear();
+      awayListeners.clear();
       selectionListeners.clear();
+      canvasKeyActionListeners.clear();
       stageReadyListeners.clear();
       stageInputListeners.clear();
       host.removeEventListener("message", onWindowMessage);
@@ -1032,7 +1119,7 @@ export function createEditingPortClient(options: {
         const stop = { kind: "watch-geometry", params: { handles: [] } };
         port?.postMessage({ v: EDITING_PROTOCOL_VERSION, id: ++lastId, ...stop });
       }
-      port?.close();
+      offered?.close();
       rejectReady(new EditingPortError("disposed", "client disposed"));
       for (const id of [...pending.keys()]) {
         settle(id, { error: new EditingPortError("disposed", "client disposed") });
@@ -1043,9 +1130,19 @@ export function createEditingPortClient(options: {
 
 export { elementHome, transformWDivisor, type MotionPathHome } from "./editing/motionPathHome";
 export {
+  MAX_CANVAS_KEY_COMBOS,
+  type ArmCanvasKeysParams,
+  type ArmCanvasKeysResult,
+  type CanvasKeyActionEvent,
+  type CanvasKeyNudgeCombo,
+  type ResolveCanvasKeyActionParams,
+  type ResolveCanvasKeyActionResult,
+} from "./editing/canvasKeys";
+export {
   caretRangeAt,
   takePlainTextOnly,
   textEditResult,
+  type TextEditAwayEvent,
   type TextEditEndedEvent,
   type TextEditCaret,
   type TextEditResult,

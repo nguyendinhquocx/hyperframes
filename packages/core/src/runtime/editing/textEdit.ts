@@ -1,8 +1,9 @@
 // `text-edit`: one in-place text editing session in the frame, for a parent that cannot script it.
 // It edits only an element it handed a handle for, and lets out nothing but text markup.
+import { postOnPort } from "../runtimePort";
 import { EDITING_ELEMENT_HANDLE, type EditingElementHandle } from "../editingElement";
 import { elementForHandle } from "../editingHandles";
-import { isStylableElement, type StylableElement } from "../domRealm";
+import { isDomNode, isStylableElement, type StylableElement } from "../domRealm";
 import { sanitizeRichTextChildren } from "../../utils/richTextSanitize";
 import { openTextEdits, isTextMarkup, MAX_EDIT_VALUE } from "./editElement";
 import { isEditableText } from "./textMarkup";
@@ -24,7 +25,7 @@ import {
 type Point = { x: number; y: number };
 type Style = Record<string, string | null>;
 export type TextEditParams =
-  | { handle: EditingElementHandle; action: "start"; caret: Point | null }
+  | { handle: EditingElementHandle; action: "start"; caret: Point | null; away?: boolean }
   | { handle: EditingElementHandle; action: "end"; keep: boolean }
   | { handle: EditingElementHandle; action: "style"; style: Style };
 export type TextEditResult = { applied: boolean; html: string | null; previous: string | null };
@@ -49,6 +50,13 @@ export type TextEditCaret = {
   height: number;
   color: string;
   viewportWidth: number;
+};
+export type TextEditAwayEvent = {
+  handle: EditingElementHandle;
+  button: 0 | 2;
+  point: Point;
+  viewportWidth: number;
+  keys: { shiftKey: boolean; metaKey: boolean; ctrlKey: boolean };
 };
 export type TextEditSelectionEvent = {
   handle: EditingElementHandle;
@@ -75,13 +83,19 @@ const isHandle = (value: unknown): value is string =>
 const isPoint = (value: unknown): value is Point =>
   isRecord(value) && keysAre(value, "x,y") && Number.isFinite(value.x) && Number.isFinite(value.y);
 
+function parseStart(handle: EditingElementHandle, params: Fields): TextEditParams | null {
+  const { caret, away } = params;
+  if (caret !== null && !isPoint(caret)) return null;
+  if (keysAre(params, "action,caret,handle")) return { handle, action: "start", caret };
+  if (keysAre(params, "action,away,caret,handle") && typeof away === "boolean")
+    return { handle, action: "start", caret, away };
+  return null;
+}
+
 export function parseTextEdit(params: unknown): TextEditParams | null {
   if (!isRecord(params) || !isHandle(params.handle)) return null;
   const { handle, action } = params;
-  if (action === "start" && keysAre(params, "action,caret,handle")) {
-    const { caret } = params;
-    return caret === null || isPoint(caret) ? { handle, action, caret } : null;
-  }
+  if (action === "start") return parseStart(handle, params);
   if (action === "end" && keysAre(params, "action,handle,keep") && typeof params.keep === "boolean")
     return { handle, action, keep: params.keep };
   if (action === "style" && keysAre(params, "action,handle,style") && isStyle(params.style))
@@ -149,6 +163,21 @@ export function textEditSelectionEvent(
   return caret === null || isCaret(caret) ? { handle, selection, caret } : null;
 }
 
+const isKeys = (value: unknown): value is TextEditAwayEvent["keys"] =>
+  isRecord(value) &&
+  keysAre(value, "ctrlKey,metaKey,shiftKey") &&
+  Object.values(value).every((flag) => typeof flag === "boolean");
+
+export function textEditAwayEvent(data: unknown, version: number): TextEditAwayEvent | null {
+  if (!isRecord(data) || !keysAre(data, "button,event,handle,keys,point,v,viewportWidth"))
+    return null;
+  if (data.v !== version || data.event !== "text-edit-away" || !isHandle(data.handle)) return null;
+  const { handle, button, point, viewportWidth, keys } = data;
+  if ((button !== 0 && button !== 2) || !isPoint(point) || !isKeys(keys)) return null;
+  if (!isFiniteNumber(viewportWidth) || viewportWidth <= 0) return null;
+  return { handle, button, point, viewportWidth, keys };
+}
+
 const isValue = (value: unknown) =>
   value === null || (typeof value === "string" && value.length <= MAX_EDIT_VALUE);
 const isTextMarkupOrNull = (value: unknown): value is string | null =>
@@ -188,6 +217,10 @@ interface Session {
 
 let session: Session | null = null;
 const NOTHING: TextEditResult = { applied: false, html: null, previous: null };
+
+export function isActiveTextEditTarget(target: EventTarget | null): boolean {
+  return Boolean(session && isDomNode(target) && session.element.contains(target));
+}
 
 function clearSelectionWithin(element: Element): void {
   const selection = element.ownerDocument.defaultView?.getSelection();
@@ -360,6 +393,33 @@ function followCaret(element: Editable, open: Session): () => void {
   };
 }
 
+function passAway(element: Editable, post: (away: Omit<TextEditAwayEvent, "handle">) => void) {
+  const doc = element.ownerDocument;
+  const view = doc.defaultView;
+  const away = (event: MouseEvent, button: 0 | 2) => ({
+    button,
+    point: { x: event.clientX, y: event.clientY },
+    viewportWidth: view?.innerWidth || 1,
+    keys: { shiftKey: event.shiftKey, metaKey: event.metaKey, ctrlKey: event.ctrlKey },
+  });
+  const afterTheBlurThatSaves = (send: () => void) => view?.setTimeout(send);
+  const onPress = (event: PointerEvent) => {
+    if (event.button !== 0 || element.contains(event.target as Node)) return;
+    const message = away(event, 0);
+    afterTheBlurThatSaves(() => post(message));
+  };
+  const onMenu = (event: MouseEvent) => {
+    event.preventDefault();
+    post(away(event, 2));
+  };
+  doc.addEventListener("pointerdown", onPress, true);
+  doc.addEventListener("contextmenu", onMenu, true);
+  return () => {
+    doc.removeEventListener("pointerdown", onPress, true);
+    doc.removeEventListener("contextmenu", onMenu, true);
+  };
+}
+
 function caretOf(open: Session): TextEditCaret | null {
   const box = open.caret.composing ? null : caretBoxIn(open.element, open.caret.side);
   const viewportWidth = open.element.ownerDocument.defaultView?.innerWidth || 1;
@@ -369,6 +429,7 @@ function caretOf(open: Session): TextEditCaret | null {
 function start(
   handle: EditingElementHandle,
   caret: Point | null,
+  hostTakesAway: boolean,
   port: MessagePort,
   version: number,
 ) {
@@ -390,19 +451,25 @@ function start(
       if (session !== open) return;
       const selection = selectionIn(editable);
       const caret = caretOf(open);
-      port.postMessage({ v: version, event: "text-edit-selection", handle, selection, caret });
+      postOnPort(port, { v: version, event: "text-edit-selection", handle, selection, caret });
     },
   };
   const endInFrame = () => {
     if (session !== open) return;
     const ended = close(true);
-    if (ended) port.postMessage({ v: version, event: "text-edit-ended", handle, ...ended });
+    if (ended) postOnPort(port, { v: version, event: "text-edit-ended", handle, ...ended });
   };
   const stopListening = listen(editable, endInFrame, open.report);
   const stopFollowing = followCaret(editable, open);
+  const stopPassing = hostTakesAway
+    ? passAway(editable, (away) =>
+        postOnPort(port, { v: version, event: "text-edit-away", handle, ...away }),
+      )
+    : () => {};
   open.stop = () => {
     stopListening();
     stopFollowing();
+    stopPassing();
   };
   session = open;
   openTextEdits.add(editable);
@@ -421,7 +488,8 @@ export function textEdit(
   port: MessagePort,
   version: number,
 ): TextEditResult {
-  if (params.action === "start") return start(params.handle, params.caret, port, version);
+  if (params.action === "start")
+    return start(params.handle, params.caret, params.away === true, port, version);
   if (session?.handle !== params.handle || session.port !== port) return NOTHING;
   if (params.action === "style") return styleSelection(session, params.style);
   const ended = close(params.keep);

@@ -22,6 +22,8 @@ import { parkFarScenesAtBoot } from "./sceneWindow";
 import { installPausedVideoCallbacks } from "./pausedVideoCallbacks";
 import { corsForSealedMedia } from "./sealedMediaCors";
 import { postStaticCompositionWhenParsed } from "./staticCompositionPost";
+import { installPreviewKeyShield } from "./editing/canvasKeys";
+import { listenForEditingConnect } from "./editingAgent";
 
 type HyperframeWindow = Window & {
   __hyperframeRuntimeBootstrapped?: boolean;
@@ -43,12 +45,15 @@ type HyperframeWindow = Window & {
 // Ensure timeline registry exists at script evaluation time.
 (window as HyperframeWindow).__timelines = (window as HyperframeWindow).__timelines || {};
 
+listenForEditingConnect();
+
 // Stamp color-graded elements with their authored inline opacity BEFORE the
 // composition's animation scripts (and the grading hide) mutate it — must run
 // at script evaluation time, while the document is still parsing.
 installAuthoredOpacityCapture();
 installAuthoredMediaCapture();
 corsForSealedMedia();
+installPreviewKeyShield();
 installPausedVideoCallbacks();
 installFlatGsapTransforms();
 trackAcceleratedCanvases();
